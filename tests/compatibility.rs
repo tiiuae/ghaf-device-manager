@@ -1,0 +1,336 @@
+// SPDX-FileCopyrightText: 2026 TII (SSRC) and the Ghaf contributors
+// SPDX-License-Identifier: Apache-2.0
+
+use std::{
+    collections::VecDeque,
+    fs,
+    path::Path,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use anyhow::{Result, bail};
+use async_trait::async_trait;
+use ghaf_device_manager::{
+    CommandRunner, Config, DeviceManager, Selector, api,
+    client::{Transport, request},
+    crosvm::Output,
+};
+use serde_json::json;
+
+#[derive(Debug)]
+struct NoCommands;
+
+#[async_trait]
+impl CommandRunner for NoCommands {
+    async fn run(&self, _: &str, args: &[String], _: Duration) -> Result<Output> {
+        bail!("unexpected command: {args:?}")
+    }
+}
+
+#[derive(Debug)]
+struct ScriptedCommands {
+    outputs: Mutex<VecDeque<Output>>,
+}
+
+#[async_trait]
+impl CommandRunner for ScriptedCommands {
+    async fn run(&self, _: &str, args: &[String], _: Duration) -> Result<Output> {
+        self.outputs
+            .lock()
+            .unwrap()
+            .pop_front()
+            .ok_or_else(|| anyhow::anyhow!("unexpected command: {args:?}"))
+    }
+}
+
+fn write(path: impl AsRef<Path>, value: &str) {
+    let path = path.as_ref();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, value).unwrap();
+}
+
+fn usb_fixture(root: &Path) {
+    let device = root.join("1-2.3");
+    write(device.join("idVendor"), "046d\n");
+    write(device.join("idProduct"), "c52b\n");
+    write(device.join("busnum"), "1\n");
+    write(device.join("devnum"), "4\n");
+    write(device.join("manufacturer"), "Logitech\n");
+    write(device.join("product"), "USB Receiver\n");
+    write(device.join("removable"), "removable\n");
+    write(device.join("bDeviceClass"), "00\n");
+    write(device.join("bDeviceSubClass"), "00\n");
+    write(device.join("bDeviceProtocol"), "00\n");
+    let interface = root.join("1-2.3:1.0");
+    write(interface.join("bInterfaceClass"), "03\n");
+    write(interface.join("bInterfaceSubClass"), "01\n");
+    write(interface.join("bInterfaceProtocol"), "02\n");
+}
+
+fn pci_fixture(root: &Path) {
+    let device = root.join("0000:00:1f.3");
+    write(device.join("vendor"), "0x8086\n");
+    write(device.join("device"), "0x51ca\n");
+    write(device.join("class"), "0x040100\n");
+    write(device.join("subsystem_vendor"), "0x1028\n");
+    write(device.join("subsystem_device"), "0x0b00\n");
+    write(device.join("driver_override"), "");
+    write(root.parent().unwrap().join("drivers_probe"), "");
+}
+
+fn config(state: &Path, socket: &Path, api_socket: Option<&Path>) -> Config {
+    serde_json::from_value(json!({
+        "usbPassthrough": [{
+            "allowedVms": ["gui-vm", "admin-vm"],
+            "tag": "input",
+            "allow": [{"vendorId": "046d", "productId": "c52b"}]
+        }],
+        "pciPassthrough": [{
+            "targetVm": "audio-vm",
+            "tag": "audio",
+            "allow": [{"address": "0000:00:1f.3"}]
+        }],
+        "vms": [
+            {"name": "gui-vm", "type": "crosvm", "socket": socket},
+            {"name": "admin-vm", "type": "crosvm", "socket": socket},
+            {"name": "audio-vm", "type": "crosvm", "socket": socket}
+        ],
+        "general": {
+            "persistency": true,
+            "statePath": state,
+            "api": {
+                "transports": api_socket.map(|_| vec!["unix"]).unwrap_or_default(),
+                "unixSocket": api_socket.unwrap_or_else(|| Path::new("/tmp/unused-vhotplug.sock")),
+            }
+        }
+    }))
+    .unwrap()
+}
+
+fn manager(dir: &tempfile::TempDir, api_socket: Option<&Path>) -> DeviceManager<NoCommands> {
+    let usb = dir.path().join("sys/usb");
+    let pci = dir.path().join("sys/pci/devices");
+    usb_fixture(&usb);
+    pci_fixture(&pci);
+    DeviceManager::with_roots(
+        config(
+            &dir.path().join("state.json"),
+            &dir.path().join("vm.sock"),
+            api_socket,
+        ),
+        NoCommands,
+        usb,
+        pci,
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn usb_list_preserves_widget_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(&dir, None);
+    let response = api::handle(
+        &manager,
+        json!({"action": "usb_list"}).as_object().unwrap().clone(),
+    )
+    .await;
+    assert_eq!(response["result"], "ok");
+    let device = &response["usb_devices"][0];
+    assert_eq!(device["device_node"], "/dev/bus/usb/001/004");
+    assert_eq!(device["product_name"], "USB Receiver");
+    assert_eq!(device["allowed_vms"], json!(["gui-vm", "admin-vm"]));
+    assert!(device["vm"].is_null());
+    assert_eq!(device["portnum"], 2);
+}
+
+#[tokio::test]
+async fn pci_list_preserves_cli_fields_and_tag_filter() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(&dir, None);
+    let response = api::handle(
+        &manager,
+        json!({"action": "pci_list", "tag": "audio"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    )
+    .await;
+    let device = &response["pci_devices"][0];
+    assert_eq!(device["address"], "0000:00:1f.3");
+    assert_eq!(device["vid"], "8086");
+    assert_eq!(device["did"], "51ca");
+    assert_eq!(device["pci_class"], 4);
+    assert_eq!(device["allowed_vms"], json!(["audio-vm"]));
+}
+
+#[tokio::test]
+async fn protocol_returns_legacy_failure_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(&dir, None);
+    let missing = api::handle(&manager, Default::default()).await;
+    assert_eq!(missing["result"], "failed");
+    assert_eq!(missing["error"], "No action specified");
+    let unknown = api::handle(
+        &manager,
+        json!({"action": "no_such_action"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    )
+    .await;
+    assert_eq!(
+        unknown,
+        json!({"result": "failed", "error": "Unknown message: no_such_action"})
+    );
+}
+
+#[test]
+fn vmm_args_include_crosvm_hotplug_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(&dir, None);
+    assert_eq!(
+        manager.vmm_args("audio-vm", true).unwrap(),
+        vec![
+            "--vfio-isolate-hotplug",
+            "--vfio",
+            "/sys/bus/pci/devices/0000:00:1f.3,iommu=viommu,removable=true",
+        ]
+    );
+    assert_eq!(
+        fs::read_to_string(
+            dir.path()
+                .join("sys/pci/devices/0000:00:1f.3/driver_override")
+        )
+        .unwrap(),
+        "vfio-pci"
+    );
+}
+
+#[tokio::test]
+async fn unix_wire_protocol_is_newline_delimited_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("api.sock");
+    let manager = Arc::new(manager(&dir, Some(&socket)));
+    let server = tokio::spawn(api::serve(Arc::clone(&manager)));
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let response = request(
+        &Transport::Unix {
+            path: socket.to_string_lossy().into_owned(),
+        },
+        json!({"action": "usb_list"}),
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response["result"], "ok");
+    assert_eq!(response["usb_devices"][0]["product_name"], "USB Receiver");
+    server.abort();
+}
+
+#[test]
+fn qemu_vm_is_rejected() {
+    let config: Config = serde_json::from_value(json!({
+        "vms": [{"name": "gui-vm", "type": "qemu", "socket": "/run/qemu.sock"}]
+    }))
+    .unwrap();
+    assert_eq!(
+        config.validate().unwrap_err().to_string(),
+        "ghaf-device-manager supports only Crosvm VMs"
+    );
+}
+
+#[tokio::test]
+async fn multi_vm_usb_requests_a_selection_without_running_crosvm() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(&dir, None);
+    let mut notifications = manager.subscribe();
+    manager.resume_usb(None).await.unwrap();
+    let notification = notifications.recv().await.unwrap();
+    assert_eq!(notification["event"], "usb_select_vm");
+    assert_eq!(notification["allowed_vms"], json!(["gui-vm", "admin-vm"]));
+    manager.resume_usb(None).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), notifications.recv())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn selected_usb_attach_completes_and_updates_legacy_list_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let usb = dir.path().join("sys/usb");
+    let pci = dir.path().join("sys/pci/devices");
+    usb_fixture(&usb);
+    pci_fixture(&pci);
+    let manager = DeviceManager::with_roots(
+        config(
+            &dir.path().join("state.json"),
+            &dir.path().join("vm.sock"),
+            None,
+        ),
+        ScriptedCommands {
+            outputs: Mutex::new(VecDeque::from([
+                Output {
+                    status: 0,
+                    stdout: "devices".into(),
+                    stderr: String::new(),
+                },
+                Output {
+                    status: 0,
+                    stdout: "devices".into(),
+                    stderr: String::new(),
+                },
+                Output {
+                    status: 0,
+                    stdout: "ok 3".into(),
+                    stderr: String::new(),
+                },
+            ])),
+        },
+        usb,
+        pci,
+    )
+    .unwrap();
+    let selector = Selector {
+        vid: Some("046d".into()),
+        pid: Some("c52b".into()),
+        ..Default::default()
+    };
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        manager.attach_usb(&selector, Some("gui-vm")),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let list = manager.usb_list(Some(false), None).await.unwrap();
+    assert_eq!(list[0]["vm"], "gui-vm");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("state.json")).unwrap(),
+        concat!(
+            "{\n",
+            "  \"selected_vms\": {\n",
+            "    \"usb-046d:c52b:None\": \"gui-vm\"\n",
+            "  },\n",
+            "  \"disconnected_devices\": [],\n",
+            "  \"crosvm_usb_ports\": {\n",
+            "    \"1-2.3\": {\n",
+            "      \"vm\": \"gui-vm\",\n",
+            "      \"port\": 3,\n",
+            "      \"socket_generation\": \"\",\n",
+            "      \"vid\": \"046d\",\n",
+            "      \"pid\": \"c52b\",\n",
+            "      \"serial\": null\n",
+            "    }\n",
+            "  }\n",
+            "}\n"
+        )
+    );
+}
