@@ -45,6 +45,24 @@ impl CommandRunner for ScriptedCommands {
     }
 }
 
+#[derive(Debug)]
+struct RecordingCommands {
+    outputs: Arc<Mutex<VecDeque<Output>>>,
+    calls: Arc<Mutex<Vec<Vec<String>>>>,
+}
+
+#[async_trait]
+impl CommandRunner for RecordingCommands {
+    async fn run(&self, _: &str, args: &[String], _: Duration) -> Result<Output> {
+        self.calls.lock().unwrap().push(args.to_vec());
+        self.outputs
+            .lock()
+            .unwrap()
+            .pop_front()
+            .ok_or_else(|| anyhow::anyhow!("unexpected command: {args:?}"))
+    }
+}
+
 fn write(path: impl AsRef<Path>, value: &str) {
     let path = path.as_ref();
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -378,5 +396,102 @@ async fn selected_usb_attach_completes_and_updates_legacy_list_fields() {
             "  }\n",
             "}\n"
         )
+    );
+}
+
+#[tokio::test]
+async fn reconciliation_reuses_live_binding_and_replaces_it_for_a_new_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let usb = dir.path().join("sys/usb");
+    let pci = dir.path().join("sys/pci/devices");
+    let state = dir.path().join("state.json");
+    let socket = dir.path().join("vm.sock");
+    usb_fixture(&usb);
+    pci_fixture(&pci);
+    write(&socket, "first generation");
+
+    let mut config = config(&state, &socket, None);
+    config.pci_passthrough.clear();
+    config.usb_passthrough[0]["targetVm"] = json!("gui-vm");
+    let outputs = Arc::new(Mutex::new(VecDeque::from([
+        Output {
+            status: 0,
+            stdout: "devices".into(),
+            stderr: String::new(),
+        },
+        Output {
+            status: 0,
+            stdout: "devices".into(),
+            stderr: String::new(),
+        },
+        Output {
+            status: 0,
+            stdout: "ok 3".into(),
+            stderr: String::new(),
+        },
+        Output {
+            status: 0,
+            stdout: "devices 3 046d c52b".into(),
+            stderr: String::new(),
+        },
+        Output {
+            status: 0,
+            stdout: "devices".into(),
+            stderr: String::new(),
+        },
+        Output {
+            status: 0,
+            stdout: "devices".into(),
+            stderr: String::new(),
+        },
+        Output {
+            status: 0,
+            stdout: "ok 4".into(),
+            stderr: String::new(),
+        },
+    ])));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let manager = DeviceManager::with_roots(
+        config,
+        RecordingCommands {
+            outputs: Arc::clone(&outputs),
+            calls: Arc::clone(&calls),
+        },
+        usb,
+        pci,
+    )
+    .unwrap();
+
+    let (first, queued) = tokio::join!(manager.reconcile(), manager.reconcile());
+    first.unwrap();
+    queued.unwrap();
+    let attach_calls = || {
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|args| args.get(1).is_some_and(|arg| arg == "attach"))
+            .count()
+    };
+    assert_eq!(attach_calls(), 1);
+    let first_state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&state).unwrap()).unwrap();
+    let first_binding = &first_state["crosvm_usb_ports"]["1-2.3"];
+    assert_eq!(first_binding["port"], 3);
+    assert_ne!(first_binding["socket_generation"], "");
+
+    fs::rename(&socket, dir.path().join("old-vm.sock")).unwrap();
+    write(&socket, "second generation");
+    manager.reconcile().await.unwrap();
+
+    assert_eq!(attach_calls(), 2);
+    assert!(outputs.lock().unwrap().is_empty());
+    let second_state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&state).unwrap()).unwrap();
+    let second_binding = &second_state["crosvm_usb_ports"]["1-2.3"];
+    assert_eq!(second_binding["port"], 4);
+    assert_ne!(
+        second_binding["socket_generation"],
+        first_binding["socket_generation"]
     );
 }

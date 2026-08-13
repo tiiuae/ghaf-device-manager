@@ -10,6 +10,9 @@ use tokio::sync::mpsc;
 use tracing::{error, warn};
 use tracing_subscriber::EnvFilter;
 
+const RECONCILE_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+const RECONCILE_SAFETY_INTERVAL: Duration = Duration::from_secs(30);
+
 #[derive(Debug, Parser)]
 #[command(about = "Crosvm device manager for Ghaf")]
 struct Args {
@@ -39,18 +42,26 @@ async fn run() -> Result<()> {
         .init();
     let config = Config::load(&args.config)?;
     let manager = Arc::new(DeviceManager::new(config, ProcessRunner)?);
-    if args.attach_connected
-        && let Err(error) = manager.reconcile().await
-    {
-        warn!(%error, "initial device reconciliation will be retried");
-    }
+    let initial_reconcile_succeeded = if args.attach_connected {
+        match manager.reconcile().await {
+            Ok(()) => true,
+            Err(error) => {
+                warn!(%error, "initial device reconciliation will be retried");
+                false
+            }
+        }
+    } else {
+        false
+    };
     let (events, mut receiver) = mpsc::channel::<()>(8);
     spawn_udev_monitor(events)?;
     let reconcile = Arc::clone(&manager);
     let event_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(2));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        interval.tick().await;
+        let mut delay = if initial_reconcile_succeeded {
+            RECONCILE_SAFETY_INTERVAL
+        } else {
+            RECONCILE_RETRY_INTERVAL
+        };
         loop {
             tokio::select! {
                 event = receiver.recv() => {
@@ -58,12 +69,16 @@ async fn run() -> Result<()> {
                         break;
                     }
                 }
-                _ = interval.tick() => {}
+                _ = tokio::time::sleep(delay) => {}
             }
             while receiver.try_recv().is_ok() {}
-            if let Err(error) = reconcile.reconcile().await {
-                warn!(%error, "device reconciliation failed");
-            }
+            delay = match reconcile.reconcile().await {
+                Ok(()) => RECONCILE_SAFETY_INTERVAL,
+                Err(error) => {
+                    warn!(%error, "device reconciliation failed");
+                    RECONCILE_RETRY_INTERVAL
+                }
+            };
         }
     });
     tokio::select! {
