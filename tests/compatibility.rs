@@ -4,6 +4,7 @@
 use std::{
     collections::VecDeque,
     fs,
+    os::unix::fs::symlink,
     path::Path,
     sync::{Arc, Mutex},
     time::Duration,
@@ -77,6 +78,23 @@ fn pci_fixture(root: &Path) {
     write(device.join("subsystem_device"), "0x0b00\n");
     write(device.join("driver_override"), "");
     write(root.parent().unwrap().join("drivers_probe"), "");
+}
+
+fn shared_iommu_group_fixture(root: &Path) {
+    let sibling = root.join("0000:00:1f.0");
+    write(sibling.join("vendor"), "0x8086\n");
+    write(sibling.join("device"), "0x5182\n");
+    write(sibling.join("class"), "0x060100\n");
+    write(sibling.join("subsystem_vendor"), "0x17aa\n");
+    write(sibling.join("subsystem_device"), "0x2315\n");
+    write(sibling.join("driver_override"), "");
+
+    let group = root.parent().unwrap().join("kernel/iommu_groups/14");
+    fs::create_dir_all(group.join("devices")).unwrap();
+    for address in ["0000:00:1f.0", "0000:00:1f.3"] {
+        symlink(&group, root.join(address).join("iommu_group")).unwrap();
+        symlink(root.join(address), group.join("devices").join(address)).unwrap();
+    }
 }
 
 fn config(state: &Path, socket: &Path, api_socket: Option<&Path>) -> Config {
@@ -204,6 +222,34 @@ fn vmm_args_include_crosvm_hotplug_contract() {
         )
         .unwrap(),
         "vfio-pci"
+    );
+}
+
+#[test]
+fn vmm_args_include_all_requested_iommu_group_members() {
+    let dir = tempfile::tempdir().unwrap();
+    let usb = dir.path().join("sys/usb");
+    let pci = dir.path().join("sys/pci/devices");
+    usb_fixture(&usb);
+    pci_fixture(&pci);
+    shared_iommu_group_fixture(&pci);
+    let mut config = config(
+        &dir.path().join("state.json"),
+        &dir.path().join("vm.sock"),
+        None,
+    );
+    config.pci_passthrough[0]["pciIommuAddAll"] = json!(true);
+    let manager = DeviceManager::with_roots(config, NoCommands, usb, pci).unwrap();
+
+    assert_eq!(
+        manager.vmm_args("audio-vm", true).unwrap(),
+        vec![
+            "--vfio-isolate-hotplug",
+            "--vfio",
+            "/sys/bus/pci/devices/0000:00:1f.0,iommu=viommu,removable=true",
+            "--vfio",
+            "/sys/bus/pci/devices/0000:00:1f.3,iommu=viommu,removable=true",
+        ]
     );
 }
 
