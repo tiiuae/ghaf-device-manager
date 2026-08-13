@@ -470,7 +470,7 @@ async fn reconciliation_reuses_live_binding_and_replaces_it_for_a_new_socket() {
             .lock()
             .unwrap()
             .iter()
-            .filter(|args| args.get(1).is_some_and(|arg| arg == "attach"))
+            .filter(|args| args.windows(2).any(|pair| pair == ["usb", "attach"]))
             .count()
     };
     assert_eq!(attach_calls(), 1);

@@ -60,7 +60,17 @@ impl<R: CommandRunner> Crosvm<R> {
     }
 
     async fn command(&self, args: Vec<String>) -> Result<String> {
-        let output = self.runner.run(&self.binary, &args, self.deadline).await?;
+        // Crosvm control commands log their process exit through syslog by default. Reconciliation
+        // invokes several short-lived commands, so forwarding those successful exits to journald
+        // creates substantial noise. Keep stdout and stderr captured for command responses and
+        // failures, but disable Crosvm's separate syslog output.
+        let command_args = std::iter::once("--no-syslog".to_owned())
+            .chain(args.iter().cloned())
+            .collect::<Vec<_>>();
+        let output = self
+            .runner
+            .run(&self.binary, &command_args, self.deadline)
+            .await?;
         if output.status != 0 {
             bail!(
                 "Crosvm command {:?} failed with code {}: {}",
@@ -246,7 +256,7 @@ fn fs_driver(device: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
 
@@ -259,6 +269,46 @@ mod tests {
         async fn run(&self, _: &str, _: &[String], _: Duration) -> Result<Output> {
             Ok(self.outputs.lock().unwrap().remove(0))
         }
+    }
+
+    struct CapturingRunner {
+        args: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    #[async_trait]
+    impl CommandRunner for CapturingRunner {
+        async fn run(&self, _: &str, args: &[String], _: Duration) -> Result<Output> {
+            self.args.lock().unwrap().push(args.to_vec());
+            Ok(Output {
+                status: 0,
+                stdout: "devices".into(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn control_commands_disable_crosvm_syslog() {
+        let args = Arc::new(Mutex::new(Vec::new()));
+        Crosvm::new(
+            "crosvm",
+            CapturingRunner {
+                args: Arc::clone(&args),
+            },
+        )
+        .usb_list("/run/vm.sock")
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *args.lock().unwrap(),
+            vec![vec![
+                "--no-syslog".to_owned(),
+                "usb".to_owned(),
+                "list".to_owned(),
+                "/run/vm.sock".to_owned(),
+            ]]
+        );
     }
 
     #[tokio::test]
