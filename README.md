@@ -17,6 +17,9 @@ startup scripts work without a coordinated userspace migration.
 
 - `ghaf-device-manager -a -c /etc/vhotplug.conf` starts the daemon and attaches
   eligible connected devices.
+- The daemon reconciles immediately on USB and PCI udev events. After a
+  successful reconciliation it performs a 30-second safety scan; failures keep
+  a two-second retry interval so VMs that are still starting are found promptly.
 - `ghaf-device usb list` uses the native CLI name.
 - `vhotplugcli usb list` is the compatibility alias installed by the Nix
   package.

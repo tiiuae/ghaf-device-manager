@@ -775,29 +775,40 @@ impl<R: CommandRunner> DeviceManager<R> {
         if self.config.has_pci_rules(vm_name) {
             args.push("--vfio-isolate-hotplug".into());
         }
+        let mut bound_pci = HashSet::new();
         let mut emitted_pci = HashSet::new();
         for (device, rule) in devices {
             let group = iommu_group(&device.address, &self.pci_root)?;
-            for address in if group.is_empty() {
+            let quarantine = if group.is_empty() {
                 vec![device.address.clone()]
             } else {
                 group
-            } {
-                if !emitted_pci.insert(address.clone()) {
+            };
+            for address in &quarantine {
+                if !bound_pci.insert(address.clone()) {
                     continue;
                 }
-                bind_vfio(&address, &self.pci_root)?;
+                bind_vfio(address, &self.pci_root)?;
             }
-            args.push("--vfio".into());
+            let passthrough = if rule.iommu_add_all {
+                quarantine
+            } else {
+                vec![device.address.clone()]
+            };
             let removable = if rule.crosvm_use_root_bus {
                 ""
             } else {
                 ",removable=true"
             };
-            args.push(format!(
-                "/sys/bus/pci/devices/{},iommu=viommu{removable}",
-                device.address
-            ));
+            for address in passthrough {
+                if !emitted_pci.insert(address.clone()) {
+                    continue;
+                }
+                args.push("--vfio".into());
+                args.push(format!(
+                    "/sys/bus/pci/devices/{address},iommu=viommu{removable}"
+                ));
+            }
         }
         for rule in &self.config.acpi_passthrough {
             if !json_enabled(rule) || rule.get("targetVm").and_then(Value::as_str) != Some(vm_name)

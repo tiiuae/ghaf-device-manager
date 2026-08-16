@@ -4,6 +4,7 @@
 use std::{
     collections::VecDeque,
     fs,
+    os::unix::fs::symlink,
     path::Path,
     sync::{Arc, Mutex},
     time::Duration,
@@ -36,6 +37,24 @@ struct ScriptedCommands {
 #[async_trait]
 impl CommandRunner for ScriptedCommands {
     async fn run(&self, _: &str, args: &[String], _: Duration) -> Result<Output> {
+        self.outputs
+            .lock()
+            .unwrap()
+            .pop_front()
+            .ok_or_else(|| anyhow::anyhow!("unexpected command: {args:?}"))
+    }
+}
+
+#[derive(Debug)]
+struct RecordingCommands {
+    outputs: Arc<Mutex<VecDeque<Output>>>,
+    calls: Arc<Mutex<Vec<Vec<String>>>>,
+}
+
+#[async_trait]
+impl CommandRunner for RecordingCommands {
+    async fn run(&self, _: &str, args: &[String], _: Duration) -> Result<Output> {
+        self.calls.lock().unwrap().push(args.to_vec());
         self.outputs
             .lock()
             .unwrap()
@@ -77,6 +96,23 @@ fn pci_fixture(root: &Path) {
     write(device.join("subsystem_device"), "0x0b00\n");
     write(device.join("driver_override"), "");
     write(root.parent().unwrap().join("drivers_probe"), "");
+}
+
+fn shared_iommu_group_fixture(root: &Path) {
+    let sibling = root.join("0000:00:1f.0");
+    write(sibling.join("vendor"), "0x8086\n");
+    write(sibling.join("device"), "0x5182\n");
+    write(sibling.join("class"), "0x060100\n");
+    write(sibling.join("subsystem_vendor"), "0x17aa\n");
+    write(sibling.join("subsystem_device"), "0x2315\n");
+    write(sibling.join("driver_override"), "");
+
+    let group = root.parent().unwrap().join("kernel/iommu_groups/14");
+    fs::create_dir_all(group.join("devices")).unwrap();
+    for address in ["0000:00:1f.0", "0000:00:1f.3"] {
+        symlink(&group, root.join(address).join("iommu_group")).unwrap();
+        symlink(root.join(address), group.join("devices").join(address)).unwrap();
+    }
 }
 
 fn config(state: &Path, socket: &Path, api_socket: Option<&Path>) -> Config {
@@ -207,6 +243,34 @@ fn vmm_args_include_crosvm_hotplug_contract() {
     );
 }
 
+#[test]
+fn vmm_args_include_all_requested_iommu_group_members() {
+    let dir = tempfile::tempdir().unwrap();
+    let usb = dir.path().join("sys/usb");
+    let pci = dir.path().join("sys/pci/devices");
+    usb_fixture(&usb);
+    pci_fixture(&pci);
+    shared_iommu_group_fixture(&pci);
+    let mut config = config(
+        &dir.path().join("state.json"),
+        &dir.path().join("vm.sock"),
+        None,
+    );
+    config.pci_passthrough[0]["pciIommuAddAll"] = json!(true);
+    let manager = DeviceManager::with_roots(config, NoCommands, usb, pci).unwrap();
+
+    assert_eq!(
+        manager.vmm_args("audio-vm", true).unwrap(),
+        vec![
+            "--vfio-isolate-hotplug",
+            "--vfio",
+            "/sys/bus/pci/devices/0000:00:1f.0,iommu=viommu,removable=true",
+            "--vfio",
+            "/sys/bus/pci/devices/0000:00:1f.3,iommu=viommu,removable=true",
+        ]
+    );
+}
+
 #[tokio::test]
 async fn unix_wire_protocol_is_newline_delimited_json() {
     let dir = tempfile::tempdir().unwrap();
@@ -332,5 +396,102 @@ async fn selected_usb_attach_completes_and_updates_legacy_list_fields() {
             "  }\n",
             "}\n"
         )
+    );
+}
+
+#[tokio::test]
+async fn reconciliation_reuses_live_binding_and_replaces_it_for_a_new_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let usb = dir.path().join("sys/usb");
+    let pci = dir.path().join("sys/pci/devices");
+    let state = dir.path().join("state.json");
+    let socket = dir.path().join("vm.sock");
+    usb_fixture(&usb);
+    pci_fixture(&pci);
+    write(&socket, "first generation");
+
+    let mut config = config(&state, &socket, None);
+    config.pci_passthrough.clear();
+    config.usb_passthrough[0]["targetVm"] = json!("gui-vm");
+    let outputs = Arc::new(Mutex::new(VecDeque::from([
+        Output {
+            status: 0,
+            stdout: "devices".into(),
+            stderr: String::new(),
+        },
+        Output {
+            status: 0,
+            stdout: "devices".into(),
+            stderr: String::new(),
+        },
+        Output {
+            status: 0,
+            stdout: "ok 3".into(),
+            stderr: String::new(),
+        },
+        Output {
+            status: 0,
+            stdout: "devices 3 046d c52b".into(),
+            stderr: String::new(),
+        },
+        Output {
+            status: 0,
+            stdout: "devices".into(),
+            stderr: String::new(),
+        },
+        Output {
+            status: 0,
+            stdout: "devices".into(),
+            stderr: String::new(),
+        },
+        Output {
+            status: 0,
+            stdout: "ok 4".into(),
+            stderr: String::new(),
+        },
+    ])));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let manager = DeviceManager::with_roots(
+        config,
+        RecordingCommands {
+            outputs: Arc::clone(&outputs),
+            calls: Arc::clone(&calls),
+        },
+        usb,
+        pci,
+    )
+    .unwrap();
+
+    let (first, queued) = tokio::join!(manager.reconcile(), manager.reconcile());
+    first.unwrap();
+    queued.unwrap();
+    let attach_calls = || {
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|args| args.windows(2).any(|pair| pair == ["usb", "attach"]))
+            .count()
+    };
+    assert_eq!(attach_calls(), 1);
+    let first_state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&state).unwrap()).unwrap();
+    let first_binding = &first_state["crosvm_usb_ports"]["1-2.3"];
+    assert_eq!(first_binding["port"], 3);
+    assert_ne!(first_binding["socket_generation"], "");
+
+    fs::rename(&socket, dir.path().join("old-vm.sock")).unwrap();
+    write(&socket, "second generation");
+    manager.reconcile().await.unwrap();
+
+    assert_eq!(attach_calls(), 2);
+    assert!(outputs.lock().unwrap().is_empty());
+    let second_state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&state).unwrap()).unwrap();
+    let second_binding = &second_state["crosvm_usb_ports"]["1-2.3"];
+    assert_eq!(second_binding["port"], 4);
+    assert_ne!(
+        second_binding["socket_generation"],
+        first_binding["socket_generation"]
     );
 }
