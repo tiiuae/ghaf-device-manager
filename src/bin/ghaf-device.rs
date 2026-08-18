@@ -58,20 +58,45 @@ enum Command {
     },
 }
 
-#[derive(Clone, Debug, Args)]
+#[derive(Clone, Debug, Args, Default)]
+#[group(required = true, multiple = false)]
 struct UsbSelectorArgs {
-    #[arg(long = "devnode")]
-    device_node: Option<String>,
-    #[arg(long)]
-    bus: Option<u32>,
-    #[arg(long)]
-    port: Option<u32>,
-    #[arg(long)]
-    vid: Option<String>,
-    #[arg(long)]
-    pid: Option<String>,
-    #[arg(long)]
-    tag: Option<String>,
+    #[command(flatten)]
+    device_node: Option<UsbDeviceNodeArgs>,
+    #[command(flatten)]
+    bus_port: Option<UsbBusPortArgs>,
+    #[command(flatten)]
+    vid_pid: Option<UsbVidPidArgs>,
+    #[command(flatten)]
+    tag: Option<UsbTagArgs>,
+}
+
+#[derive(Clone, Debug, Args)]
+struct UsbDeviceNodeArgs {
+    #[arg(long = "devnode", conflicts_with_all = ["bus", "port", "vid", "pid", "tag"])]
+    device_node: String,
+}
+
+#[derive(Clone, Debug, Args)]
+struct UsbBusPortArgs {
+    #[arg(long, conflicts_with_all = ["devnode", "vid", "pid", "tag"])]
+    bus: u32,
+    #[arg(long, conflicts_with_all = ["devnode", "vid", "pid", "tag"])]
+    port: u32,
+}
+
+#[derive(Clone, Debug, Args)]
+struct UsbVidPidArgs {
+    #[arg(long, conflicts_with_all = ["devnode", "bus", "port", "tag"])]
+    vid: String,
+    #[arg(long, conflicts_with_all = ["devnode", "bus", "port", "tag"])]
+    pid: String,
+}
+
+#[derive(Clone, Debug, Args)]
+struct UsbTagArgs {
+    #[arg(long, conflicts_with_all = ["devnode", "bus", "port", "vid", "pid"])]
+    tag: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -106,16 +131,35 @@ enum UsbAction {
     },
 }
 
-#[derive(Clone, Debug, Args)]
+#[derive(Clone, Debug, Args, Default)]
+#[group(required = true, multiple = false)]
 struct PciSelectorArgs {
-    #[arg(long)]
-    address: Option<String>,
-    #[arg(long)]
-    vid: Option<String>,
-    #[arg(long)]
-    did: Option<String>,
-    #[arg(long)]
-    tag: Option<String>,
+    #[command(flatten)]
+    address: Option<PciAddressArgs>,
+    #[command(flatten)]
+    vid_did: Option<PciVidDidArgs>,
+    #[command(flatten)]
+    tag: Option<PciTagArgs>,
+}
+
+#[derive(Clone, Debug, Args)]
+struct PciAddressArgs {
+    #[arg(long, conflicts_with_all = ["vid", "did", "tag"])]
+    address: String,
+}
+
+#[derive(Clone, Debug, Args)]
+struct PciVidDidArgs {
+    #[arg(long, conflicts_with_all = ["address", "tag"])]
+    vid: String,
+    #[arg(long, conflicts_with_all = ["address", "tag"])]
+    did: String,
+}
+
+#[derive(Clone, Debug, Args)]
+struct PciTagArgs {
+    #[arg(long, conflicts_with_all = ["address", "vid", "did"])]
+    tag: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -229,40 +273,30 @@ impl From<UsbSelectorArgs> for UsbSelector {
     fn from(value: UsbSelectorArgs) -> Self {
         match value {
             UsbSelectorArgs {
-                device_node: Some(device_node),
-                bus: None,
-                port: None,
-                vid: None,
-                pid: None,
+                device_node: Some(UsbDeviceNodeArgs { device_node }),
+                bus_port: None,
+                vid_pid: None,
                 tag: None,
             } => Self::DeviceNode { device_node },
             UsbSelectorArgs {
                 device_node: None,
-                bus: Some(bus),
-                port: Some(port),
-                vid: None,
-                pid: None,
+                bus_port: Some(UsbBusPortArgs { bus, port }),
+                vid_pid: None,
                 tag: None,
             } => Self::BusPort { bus, port },
             UsbSelectorArgs {
                 device_node: None,
-                bus: None,
-                port: None,
-                vid: Some(vid),
-                pid: Some(pid),
+                bus_port: None,
+                vid_pid: Some(UsbVidPidArgs { vid, pid }),
                 tag: None,
             } => Self::VidPid { vid, pid },
             UsbSelectorArgs {
                 device_node: None,
-                bus: None,
-                port: None,
-                vid: None,
-                pid: None,
-                tag: Some(tag),
+                bus_port: None,
+                vid_pid: None,
+                tag: Some(UsbTagArgs { tag }),
             } => Self::Tag { tag },
-            _ => {
-                panic!("invalid USB selector; clap should have enforced mutually exclusive fields")
-            }
+            _ => unreachable!("clap should enforce exactly one USB selector"),
         }
     }
 }
@@ -271,26 +305,21 @@ impl From<PciSelectorArgs> for PciSelector {
     fn from(value: PciSelectorArgs) -> Self {
         match value {
             PciSelectorArgs {
-                address: Some(address),
-                vid: None,
-                did: None,
+                address: Some(PciAddressArgs { address }),
+                vid_did: None,
                 tag: None,
             } => Self::Address { address },
             PciSelectorArgs {
                 address: None,
-                vid: Some(vid),
-                did: Some(did),
+                vid_did: Some(PciVidDidArgs { vid, did }),
                 tag: None,
             } => Self::VidDid { vid, did },
             PciSelectorArgs {
                 address: None,
-                vid: None,
-                did: None,
-                tag: Some(tag),
+                vid_did: None,
+                tag: Some(PciTagArgs { tag }),
             } => Self::Tag { tag },
-            _ => {
-                panic!("invalid PCI selector; clap should have enforced mutually exclusive fields")
-            }
+            _ => unreachable!("clap should enforce exactly one PCI selector"),
         }
     }
 }
@@ -306,18 +335,21 @@ fn transport(cli: &Cli) -> Result<Transport> {
         TransportKind::Unix => Transport::Unix {
             path: cli.path.clone(),
         },
-        TransportKind::Tcp => Transport::Tcp {
-            host: cli.host.clone(),
-            port: cli.net_port,
-        },
+        TransportKind::Tcp => {
+            let port = cli
+                .net_port
+                .try_into()
+                .context("TCP port must be at most 65535")?;
+            Transport::Tcp {
+                host: cli.host.clone(),
+                port,
+            }
+        }
         TransportKind::Vsock => Transport::Vsock {
             cid: cli.cid,
             port: cli.net_port,
         },
     };
-    if matches!(transport, Transport::Tcp { .. }) && cli.net_port > u16::MAX.into() {
-        bail!("TCP port must be at most {}", u16::MAX);
-    }
     Ok(transport)
 }
 

@@ -22,7 +22,7 @@ const MAX_MESSAGE: usize = 1024 * 1024;
 #[derive(Clone, Debug)]
 pub enum Transport {
     Unix { path: String },
-    Tcp { host: String, port: u32 },
+    Tcp { host: String, port: u16 },
     Vsock { cid: u32, port: u32 },
 }
 
@@ -35,11 +35,7 @@ where
         match transport {
             Transport::Unix { path } => exchange(UnixStream::connect(path).await?, message).await,
             Transport::Tcp { host, port } => {
-                exchange(
-                    TcpStream::connect((host.as_str(), *port as u16)).await?,
-                    message,
-                )
-                .await
+                exchange(TcpStream::connect((host.as_str(), *port)).await?, message).await
             }
             Transport::Vsock { cid, port } => {
                 exchange(
@@ -79,7 +75,7 @@ where
         }
         Transport::Tcp { host, port } => {
             listen_stream(
-                TcpStream::connect((host.as_str(), *port as u16)).await?,
+                TcpStream::connect((host.as_str(), *port)).await?,
                 &mut callback,
             )
             .await
