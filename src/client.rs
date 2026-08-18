@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 TII (SSRC) and the Ghaf contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{fs::File, os::fd::AsRawFd, time::Duration};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
@@ -113,31 +113,10 @@ where
     bail!("API connection closed by remote")
 }
 
-// Linux defines IOCTL_VM_SOCKETS_GET_LOCAL_CID as _IO(7, 0xb9), even though
-// the ioctl writes the CID through its pointer argument.  Using ioctl_read!
-// changes the request number by adding the _IOC_READ direction bits and makes
-// the kernel reject it with ENOTTY.
-const IOCTL_VM_SOCKETS_GET_LOCAL_CID: libc::c_ulong = nix::request_code_none!(7, 0xb9);
-
 #[must_use]
 pub fn running_in_vm() -> bool {
-    let Ok(file) = File::open("/dev/vsock") else {
-        return false;
-    };
-    let mut cid = 0u32;
-    // SAFETY: the ioctl writes one u32 into the valid pointer supplied here.
-    if unsafe { libc::ioctl(file.as_raw_fd(), IOCTL_VM_SOCKETS_GET_LOCAL_CID, &mut cid) } < 0 {
-        return false;
-    }
-    cid != u32::MAX && cid != 2 && cid != 1
-}
-
-#[cfg(test)]
-mod tests {
-    use super::IOCTL_VM_SOCKETS_GET_LOCAL_CID;
-
-    #[test]
-    fn local_cid_ioctl_uses_linux_none_direction_abi() {
-        assert_eq!(IOCTL_VM_SOCKETS_GET_LOCAL_CID, 0x7b9);
+    match vsock::get_local_cid() {
+        Ok(cid) => cid != u32::MAX && cid != 2 && cid != 1,
+        Err(_) => false,
     }
 }
