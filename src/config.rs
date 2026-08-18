@@ -16,52 +16,22 @@ use serde_json::Value;
 
 use crate::device::{PciDevice, UsbDevice};
 
-fn default_true() -> bool {
-    true
-}
+const DEFAULT_STATE_PATH: &str = "/var/lib/vhotplug/vhotplug.state";
+const DEFAULT_CROSVM: &str = "crosvm";
+const DEFAULT_MODPROBE: &str = "modprobe";
+const DEFAULT_MODINFO: &str = "modinfo";
+const DEFAULT_API_PORT: u32 = 2000;
+const DEFAULT_API_HOST: &str = "127.0.0.1";
+const DEFAULT_UNIX_SOCKET: &str = "/var/lib/vhotplug/vhotplug.sock";
 
-fn default_state_path() -> String {
-    "/var/lib/vhotplug/vhotplug.state".into()
-}
-
-fn default_crosvm() -> String {
-    "crosvm".into()
-}
-
-fn default_modprobe() -> String {
-    "modprobe".into()
-}
-
-fn default_modinfo() -> String {
-    "modinfo".into()
-}
-
-fn default_api_port() -> u32 {
-    2000
-}
-
-fn default_api_host() -> String {
-    "127.0.0.1".into()
-}
-
-fn default_unix_socket() -> String {
-    "/var/lib/vhotplug/vhotplug.sock".into()
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct Config {
-    #[serde(default)]
     pub usb_passthrough: Vec<Value>,
-    #[serde(default)]
     pub pci_passthrough: Vec<Value>,
-    #[serde(default)]
     pub evdev_passthrough: Vec<Value>,
-    #[serde(default)]
     pub acpi_passthrough: Vec<Value>,
-    #[serde(default)]
     pub vms: Vec<Vm>,
-    #[serde(default)]
     pub general: General,
     #[serde(skip)]
     driver_cache: Arc<Mutex<HashMap<String, Vec<String>>>>,
@@ -77,19 +47,13 @@ pub struct Vm {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub struct General {
-    #[serde(default = "default_true")]
     pub persistency: bool,
-    #[serde(default = "default_state_path")]
     pub state_path: String,
-    #[serde(default = "default_crosvm")]
     pub crosvm: String,
-    #[serde(default = "default_modprobe")]
     pub modprobe: String,
-    #[serde(default = "default_modinfo")]
     pub modinfo: String,
-    #[serde(default)]
     pub api: Api,
 }
 
@@ -97,29 +61,23 @@ impl Default for General {
     fn default() -> Self {
         Self {
             persistency: true,
-            state_path: default_state_path(),
-            crosvm: default_crosvm(),
-            modprobe: default_modprobe(),
-            modinfo: default_modinfo(),
+            state_path: DEFAULT_STATE_PATH.to_owned(),
+            crosvm: DEFAULT_CROSVM.to_owned(),
+            modprobe: DEFAULT_MODPROBE.to_owned(),
+            modinfo: DEFAULT_MODINFO.to_owned(),
             api: Api::default(),
         }
     }
 }
 
 #[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub struct Api {
-    #[serde(default = "default_true")]
     pub enable: bool,
-    #[serde(default)]
     pub transports: Vec<String>,
-    #[serde(default = "default_api_host")]
     pub host: String,
-    #[serde(default = "default_api_port")]
     pub port: u32,
-    #[serde(default)]
     pub allowed_cids: Vec<u32>,
-    #[serde(default = "default_unix_socket")]
     pub unix_socket: String,
     pub unix_socket_user: Option<String>,
     pub unix_socket_group: Option<String>,
@@ -131,10 +89,10 @@ impl Default for Api {
         Self {
             enable: true,
             transports: Vec::new(),
-            host: default_api_host(),
-            port: default_api_port(),
+            host: DEFAULT_API_HOST.to_owned(),
+            port: DEFAULT_API_PORT,
             allowed_cids: Vec::new(),
-            unix_socket: default_unix_socket(),
+            unix_socket: DEFAULT_UNIX_SOCKET.to_owned(),
             unix_socket_user: None,
             unix_socket_group: None,
             unix_socket_mode: None,
