@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::manager::Selector;
 
@@ -53,6 +54,51 @@ pub enum Action {
         qemu_bus_start_index: Option<u32>,
         require_pci: bool,
     },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "result")]
+pub enum Response {
+    Ok {
+        #[serde(flatten)]
+        payload: ResponsePayload,
+    },
+    Failed {
+        error: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ResponsePayload {
+    Empty(EmptyResponse),
+    UsbList(UsbListResponse),
+    PciList(PciListResponse),
+    VmmArgs(VmmArgsResponse),
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct EmptyResponse;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UsbListResponse {
+    pub usb_devices: Vec<Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PciListResponse {
+    pub pci_devices: Vec<Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VmmArgsResponse {
+    pub vmm_args: Vec<String>,
+}
+
+impl ResponsePayload {
+    pub fn empty() -> Self {
+        Self::Empty(EmptyResponse)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -113,6 +159,18 @@ impl From<PciSelector> for Selector {
                 tag: Some(tag),
                 ..Self::default()
             },
+        }
+    }
+}
+
+impl Response {
+    pub fn ok(payload: ResponsePayload) -> Self {
+        Self::Ok { payload }
+    }
+
+    pub fn failed(error: impl Into<String>) -> Self {
+        Self::Failed {
+            error: error.into(),
         }
     }
 }

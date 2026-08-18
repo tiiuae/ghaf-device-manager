@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ghaf_device_manager::{
     client::{Transport, listen, request, running_in_vm},
-    protocol::{Action, PciSelector, UsbSelector},
+    protocol::{Action, PciSelector, Response, ResponsePayload, UsbSelector},
 };
 use serde_json::Value;
 
@@ -166,26 +166,15 @@ enum VmmAction {
     },
 }
 
-fn ensure_ok(response: Value) -> Result<Value> {
-    if response.get("result").and_then(Value::as_str) == Some("failed") {
-        bail!(
-            response
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("device-manager request failed")
-                .to_owned()
-        );
+fn ensure_ok(response: Response) -> Result<ResponsePayload> {
+    match response {
+        Response::Ok { payload } => Ok(payload),
+        Response::Failed { error } => bail!(error),
     }
-    Ok(response)
 }
 
-fn print_usb(response: &Value, short: bool) {
-    for device in response
-        .get("usb_devices")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
+fn print_usb(devices: &[Value], short: bool) {
+    for device in devices {
         println!(
             "{}:{} {} {}",
             text(device, "vid"),
@@ -199,13 +188,8 @@ fn print_usb(response: &Value, short: bool) {
     }
 }
 
-fn print_pci(response: &Value, short: bool) {
-    for device in response
-        .get("pci_devices")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
+fn print_pci(devices: &[Value], short: bool) {
+    for device in devices {
         println!(
             "{} {}:{} {} {}",
             text(device, "address"),
@@ -341,7 +325,7 @@ async fn request_with_retry(
     transport: &Transport,
     message: &Action,
     deadline: Duration,
-) -> Result<Value> {
+) -> Result<Response> {
     let start = Instant::now();
     loop {
         let remaining = deadline.saturating_sub(start.elapsed());
@@ -486,27 +470,26 @@ async fn run() -> Result<()> {
         request(&transport, &message, deadline).await?
     })?;
     match output {
-        Some(("usb", short)) => print_usb(&response, short),
-        Some(("pci", short)) => print_pci(&response, short),
+        Some(("usb", short)) => match response {
+            ResponsePayload::UsbList(payload) => print_usb(&payload.usb_devices, short),
+            other => bail!("unexpected response payload: {other:?}"),
+        },
+        Some(("pci", short)) => match response {
+            ResponsePayload::PciList(payload) => print_pci(&payload.pci_devices, short),
+            other => bail!("unexpected response payload: {other:?}"),
+        },
         Some(("vmm", _)) => {
-            let args = response
-                .get("vmm_args")
-                .and_then(Value::as_array)
-                .context("response has no vmm_args")?;
+            let ResponsePayload::VmmArgs(payload) = response else {
+                bail!("unexpected response payload");
+            };
+            let args = payload.vmm_args;
             if args
                 .iter()
-                .filter_map(Value::as_str)
                 .any(|argument| argument.chars().any(char::is_whitespace))
             {
                 bail!("VMM arguments containing whitespace are not supported");
             }
-            print!(
-                "{}",
-                args.iter()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            );
+            print!("{}", args.join(" "));
         }
         _ => {}
     }

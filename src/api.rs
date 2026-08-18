@@ -11,7 +11,6 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{Value, json};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, UnixListener},
@@ -21,7 +20,13 @@ use tokio_util::codec::{Framed, LinesCodec};
 use tokio_vsock::{VMADDR_CID_ANY, VsockAddr, VsockListener};
 use tracing::{info, warn};
 
-use crate::{crosvm::CommandRunner, manager::DeviceManager, protocol::Action};
+use crate::{
+    crosvm::CommandRunner,
+    manager::DeviceManager,
+    protocol::{
+        Action, PciListResponse, Response, ResponsePayload, UsbListResponse, VmmArgsResponse,
+    },
+};
 
 const MAX_MESSAGE: usize = 1024 * 1024;
 
@@ -170,73 +175,76 @@ where
                 }
                 handle(manager, message).await
             }
-            Err(error) => {
-                json!({"result": "failed", "error": format!("Invalid API message: {error}")})
-            }
+            Err(error) => Response::failed(format!("Invalid API message: {error}")),
         },
-        Err(error) => json!({"result": "failed", "error": format!("Invalid API message: {error}")}),
+        Err(error) => Response::failed(format!("Invalid API message: {error}")),
     };
-    framed.send(response.to_string()).await.is_ok()
+    framed
+        .send(serde_json::to_string(&response).unwrap())
+        .await
+        .is_ok()
 }
 
-pub async fn handle<R: CommandRunner>(manager: &DeviceManager<R>, message: Action) -> Value {
+pub async fn handle<R: CommandRunner>(manager: &DeviceManager<R>, message: Action) -> Response {
     match handle_inner(manager, message).await {
-        Ok(value) => value,
-        Err(error) => json!({"result": "failed", "error": error.to_string()}),
+        Ok(payload) => Response::ok(payload),
+        Err(error) => Response::failed(error.to_string()),
     }
 }
 
 async fn handle_inner<R: CommandRunner>(
     manager: &DeviceManager<R>,
     message: Action,
-) -> Result<Value> {
+) -> Result<ResponsePayload> {
     match message {
-        Action::EnableNotifications => Ok(json!({"result": "ok"})),
-        Action::UsbList { disconnected, tag } => Ok(
-            json!({"result": "ok", "usb_devices": manager.usb_list(disconnected, tag.as_deref()).await?}),
-        ),
+        Action::EnableNotifications => Ok(ResponsePayload::empty()),
+        Action::UsbList { disconnected, tag } => Ok(ResponsePayload::UsbList(UsbListResponse {
+            usb_devices: manager.usb_list(disconnected, tag.as_deref()).await?,
+        })),
         Action::UsbAttach { selector, vm } => {
             let selector: crate::manager::Selector = selector.into();
             manager.attach_usb(&selector, vm.as_deref()).await?;
-            Ok(json!({"result": "ok"}))
+            Ok(ResponsePayload::empty())
         }
         Action::UsbDetach { selector } => {
             let selector: crate::manager::Selector = selector.into();
             manager.detach_usb(&selector, true).await?;
-            Ok(json!({"result": "ok"}))
+            Ok(ResponsePayload::empty())
         }
         Action::UsbSuspend { vm } => {
             manager.suspend_usb(vm.as_deref()).await?;
-            Ok(json!({"result": "ok"}))
+            Ok(ResponsePayload::empty())
         }
         Action::UsbResume { vm } => {
             manager.resume_usb(vm.as_deref()).await?;
-            Ok(json!({"result": "ok"}))
+            Ok(ResponsePayload::empty())
         }
-        Action::PciList { disconnected, tag } => Ok(
-            json!({"result": "ok", "pci_devices": manager.pci_list(disconnected, tag.as_deref()).await?}),
-        ),
+        Action::PciList { disconnected, tag } => Ok(ResponsePayload::PciList(PciListResponse {
+            pci_devices: manager.pci_list(disconnected, tag.as_deref()).await?,
+        })),
         Action::PciAttach { selector, vm } => {
             let selector: crate::manager::Selector = selector.into();
             manager.attach_pci(&selector, vm.as_deref()).await?;
-            Ok(json!({"result": "ok"}))
+            Ok(ResponsePayload::empty())
         }
         Action::PciDetach { selector } => {
             let selector: crate::manager::Selector = selector.into();
             manager.detach_pci(&selector, true).await?;
-            Ok(json!({"result": "ok"}))
+            Ok(ResponsePayload::empty())
         }
         Action::PciSuspend { vm } => {
             manager.suspend_pci(vm.as_deref()).await?;
-            Ok(json!({"result": "ok"}))
+            Ok(ResponsePayload::empty())
         }
         Action::PciResume { vm } => {
             manager.resume_pci(vm.as_deref()).await?;
-            Ok(json!({"result": "ok"}))
+            Ok(ResponsePayload::empty())
         }
         Action::VmmArgs {
             vm, require_pci, ..
-        } => Ok(json!({"result": "ok", "vmm_args": manager.vmm_args(&vm, require_pci)?})),
+        } => Ok(ResponsePayload::VmmArgs(VmmArgsResponse {
+            vmm_args: manager.vmm_args(&vm, require_pci)?,
+        })),
     }
 }
 

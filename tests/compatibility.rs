@@ -13,7 +13,8 @@ use std::{
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use ghaf_device_manager::{
-    Action, CommandRunner, Config, DeviceManager, PciSelector, Selector, UsbSelector, api,
+    Action, CommandRunner, Config, DeviceManager, PciSelector, Response, Selector, UsbSelector,
+    api,
     client::{Transport, request},
     crosvm::Output,
 };
@@ -166,14 +167,17 @@ fn manager(dir: &tempfile::TempDir, api_socket: Option<&Path>) -> DeviceManager<
 async fn usb_list_preserves_widget_fields() {
     let dir = tempfile::tempdir().unwrap();
     let manager = manager(&dir, None);
-    let response = api::handle(
-        &manager,
-        Action::UsbList {
-            disconnected: None,
-            tag: None,
-        },
+    let response = serde_json::to_value(
+        api::handle(
+            &manager,
+            Action::UsbList {
+                disconnected: None,
+                tag: None,
+            },
+        )
+        .await,
     )
-    .await;
+    .unwrap();
     assert_eq!(response["result"], "ok");
     let device = &response["usb_devices"][0];
     assert_eq!(device["device_node"], "/dev/bus/usb/001/004");
@@ -187,14 +191,17 @@ async fn usb_list_preserves_widget_fields() {
 async fn pci_list_preserves_cli_fields_and_tag_filter() {
     let dir = tempfile::tempdir().unwrap();
     let manager = manager(&dir, None);
-    let response = api::handle(
-        &manager,
-        Action::PciList {
-            disconnected: None,
-            tag: Some("audio".to_owned()),
-        },
+    let response = serde_json::to_value(
+        api::handle(
+            &manager,
+            Action::PciList {
+                disconnected: None,
+                tag: Some("audio".to_owned()),
+            },
+        )
+        .await,
     )
-    .await;
+    .unwrap();
     let device = &response["pci_devices"][0];
     assert_eq!(device["address"], "0000:00:1f.3");
     assert_eq!(device["vid"], "8086");
@@ -209,7 +216,8 @@ async fn protocol_returns_legacy_failure_shape() {
     let manager = manager(&dir, None);
     assert!(serde_json::from_value::<Action>(json!({})).is_err());
     assert!(serde_json::from_value::<Action>(json!({"action": "no_such_action"})).is_err());
-    let response = api::handle(&manager, Action::EnableNotifications).await;
+    let response =
+        serde_json::to_value(api::handle(&manager, Action::EnableNotifications).await).unwrap();
     assert_eq!(response, json!({"result": "ok"}));
 }
 
@@ -275,7 +283,7 @@ async fn unix_wire_protocol_is_newline_delimited_json() {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let response = request(
+    let response: Response = request(
         &Transport::Unix {
             path: socket.to_string_lossy().into_owned(),
         },
@@ -287,6 +295,7 @@ async fn unix_wire_protocol_is_newline_delimited_json() {
     )
     .await
     .unwrap();
+    let response = serde_json::to_value(response).unwrap();
     assert_eq!(response["result"], "ok");
     assert_eq!(response["usb_devices"][0]["product_name"], "USB Receiver");
     server.abort();

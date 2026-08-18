@@ -13,4 +13,4 @@ pub mod state;
 pub use config::Config;
 pub use crosvm::{CommandRunner, Crosvm, ProcessRunner};
 pub use manager::{DeviceManager, Selector};
-pub use protocol::{Action, PciSelector, UsbSelector};
+pub use protocol::{Action, PciSelector, Response, ResponsePayload, UsbSelector};

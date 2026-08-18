@@ -5,7 +5,7 @@ use std::{fs::File, os::fd::AsRawFd, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
-use serde::Serialize;
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -15,7 +15,7 @@ use tokio::{
 use tokio_util::codec::{Framed, LinesCodec};
 use tokio_vsock::{VsockAddr, VsockStream};
 
-use crate::protocol::Action;
+use crate::protocol::{Action, Response};
 
 const MAX_MESSAGE: usize = 1024 * 1024;
 
@@ -26,9 +26,10 @@ pub enum Transport {
     Vsock { cid: u32, port: u32 },
 }
 
-pub async fn request<T>(transport: &Transport, message: &T, deadline: Duration) -> Result<Value>
+pub async fn request<T, R>(transport: &Transport, message: &T, deadline: Duration) -> Result<R>
 where
     T: Serialize + ?Sized,
+    R: DeserializeOwned,
 {
     timeout(deadline, async {
         match transport {
@@ -53,10 +54,11 @@ where
     .context("device-manager request timed out")?
 }
 
-async fn exchange<S, T>(stream: S, message: &T) -> Result<Value>
+async fn exchange<S, T, R>(stream: S, message: &T) -> Result<R>
 where
     S: AsyncRead + AsyncWrite + Unpin,
     T: Serialize + ?Sized,
+    R: DeserializeOwned,
 {
     let mut framed = Framed::new(stream, LinesCodec::new_with_max_length(MAX_MESSAGE));
     framed.send(serde_json::to_string(message)?).await?;
@@ -64,7 +66,7 @@ where
         .next()
         .await
         .context("API connection closed by remote")??;
-    serde_json::from_str(&response).context("invalid JSON in API response")
+    serde_json::from_str::<R>(&response).context("invalid JSON in API response")
 }
 
 pub async fn listen<F>(transport: &Transport, mut callback: F) -> Result<()>
@@ -105,9 +107,9 @@ where
         .next()
         .await
         .context("API connection closed by remote")??;
-    let response: Value = serde_json::from_str(&response)?;
-    if response.get("result").and_then(Value::as_str) != Some("ok") {
-        bail!("failed to enable notifications: {response}");
+    match serde_json::from_str::<Response>(&response)? {
+        Response::Ok { .. } => {}
+        Response::Failed { error } => bail!("failed to enable notifications: {error}"),
     }
     while let Some(message) = framed.next().await {
         callback(serde_json::from_str(&message?)?);
