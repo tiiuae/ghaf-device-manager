@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
-    ffi::CString,
     fs,
     os::unix::fs::{PermissionsExt, chown},
     path::Path,
@@ -26,6 +25,7 @@ use crate::{
     protocol::{
         Action, PciListResponse, Response, ResponsePayload, UsbListResponse, VmmArgsResponse,
     },
+    unix_ids::{group_id, user_id},
 };
 
 const MAX_MESSAGE: usize = 1024 * 1024;
@@ -254,14 +254,8 @@ fn configure_unix_socket(
     group: Option<&str>,
     mode: Option<&str>,
 ) -> Result<()> {
-    let uid = match user {
-        Some(user) => Some(user_id(user)?),
-        None => None,
-    };
-    let gid = match group {
-        Some(group) => Some(group_id(group)?),
-        None => None,
-    };
+    let uid = user.map(user_id).transpose()?;
+    let gid = group.map(group_id).transpose()?;
     if uid.is_some() || gid.is_some() {
         chown(path, uid, gid)?;
     }
@@ -270,26 +264,4 @@ fn configure_unix_socket(
         fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
     }
     Ok(())
-}
-
-fn user_id(name: &str) -> Result<u32> {
-    let name = CString::new(name)?;
-    // SAFETY: getpwnam returns a process-owned record valid until the next libc lookup.
-    let record = unsafe { libc::getpwnam(name.as_ptr()) };
-    if record.is_null() {
-        bail!("unknown user {}", name.to_string_lossy());
-    }
-    // SAFETY: null was checked and we copy the scalar field immediately.
-    Ok(unsafe { (*record).pw_uid })
-}
-
-fn group_id(name: &str) -> Result<u32> {
-    let name = CString::new(name)?;
-    // SAFETY: getgrnam returns a process-owned record valid until the next libc lookup.
-    let record = unsafe { libc::getgrnam(name.as_ptr()) };
-    if record.is_null() {
-        bail!("unknown group {}", name.to_string_lossy());
-    }
-    // SAFETY: null was checked and we copy the scalar field immediately.
-    Ok(unsafe { (*record).gr_gid })
 }

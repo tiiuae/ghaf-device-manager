@@ -3,7 +3,6 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    ffi::CString,
     fs,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
@@ -11,6 +10,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use nix::unistd::{Gid, Uid, chown};
 use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex, broadcast};
 use tracing::warn;
@@ -21,6 +21,7 @@ use crate::{
     device::{PciDevice, UsbDevice, iommu_group, scan_pci, scan_usb},
     protocol::{PciListDevice, UsbListDevice},
     state::{State, UsbPortBinding},
+    unix_ids::{group_id, user_id},
 };
 
 #[derive(Clone, Debug, Default)]
@@ -960,37 +961,15 @@ fn chown_named(path: &str, user: Option<&str>, group: Option<&str>) -> Result<()
     if user.is_none() && group.is_none() {
         return Ok(());
     }
-    let uid = match user {
-        Some(name) => {
-            let name = CString::new(name)?;
-            // SAFETY: getpwnam returns a process-owned record and the scalar is copied immediately.
-            let record = unsafe { libc::getpwnam(name.as_ptr()) };
-            if record.is_null() {
-                bail!("unknown ACPI table user {}", name.to_string_lossy());
-            }
-            // SAFETY: the pointer was checked for null.
-            unsafe { (*record).pw_uid }
-        }
-        None => u32::MAX,
-    };
-    let gid = match group {
-        Some(name) => {
-            let name = CString::new(name)?;
-            // SAFETY: getgrnam returns a process-owned record and the scalar is copied immediately.
-            let record = unsafe { libc::getgrnam(name.as_ptr()) };
-            if record.is_null() {
-                bail!("unknown ACPI table group {}", name.to_string_lossy());
-            }
-            // SAFETY: the pointer was checked for null.
-            unsafe { (*record).gr_gid }
-        }
-        None => u32::MAX,
-    };
-    let path = CString::new(path)?;
-    // SAFETY: path is a valid NUL-terminated string; uid/gid use -1 to preserve an owner.
-    if unsafe { libc::chown(path.as_ptr(), uid, gid) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
+    let uid = user
+        .map(|name| user_id(name).with_context(|| format!("unknown ACPI table user {name}")))
+        .transpose()?
+        .map(Uid::from_raw);
+    let gid = group
+        .map(|name| group_id(name).with_context(|| format!("unknown ACPI table group {name}")))
+        .transpose()?
+        .map(Gid::from_raw);
+    chown(path, uid, gid)?;
     Ok(())
 }
 
