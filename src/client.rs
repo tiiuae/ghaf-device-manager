@@ -5,6 +5,7 @@ use std::{fs::File, os::fd::AsRawFd, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
+use serde::Serialize;
 use serde_json::Value;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -13,6 +14,8 @@ use tokio::{
 };
 use tokio_util::codec::{Framed, LinesCodec};
 use tokio_vsock::{VsockAddr, VsockStream};
+
+use crate::protocol::Action;
 
 const MAX_MESSAGE: usize = 1024 * 1024;
 
@@ -23,7 +26,10 @@ pub enum Transport {
     Vsock { cid: u32, port: u32 },
 }
 
-pub async fn request(transport: &Transport, message: Value, deadline: Duration) -> Result<Value> {
+pub async fn request<T>(transport: &Transport, message: &T, deadline: Duration) -> Result<Value>
+where
+    T: Serialize + ?Sized,
+{
     timeout(deadline, async {
         match transport {
             Transport::Unix { path } => exchange(UnixStream::connect(path).await?, message).await,
@@ -47,12 +53,13 @@ pub async fn request(transport: &Transport, message: Value, deadline: Duration) 
     .context("device-manager request timed out")?
 }
 
-async fn exchange<S>(stream: S, message: Value) -> Result<Value>
+async fn exchange<S, T>(stream: S, message: &T) -> Result<Value>
 where
     S: AsyncRead + AsyncWrite + Unpin,
+    T: Serialize + ?Sized,
 {
     let mut framed = Framed::new(stream, LinesCodec::new_with_max_length(MAX_MESSAGE));
-    framed.send(message.to_string()).await?;
+    framed.send(serde_json::to_string(message)?).await?;
     let response = framed
         .next()
         .await
@@ -92,7 +99,7 @@ where
 {
     let mut framed = Framed::new(stream, LinesCodec::new_with_max_length(MAX_MESSAGE));
     framed
-        .send(serde_json::json!({"action": "enable_notifications"}).to_string())
+        .send(serde_json::to_string(&Action::EnableNotifications)?)
         .await?;
     let response = framed
         .next()

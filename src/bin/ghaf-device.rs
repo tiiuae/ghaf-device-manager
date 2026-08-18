@@ -5,8 +5,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use ghaf_device_manager::client::{Transport, listen, request, running_in_vm};
-use serde_json::{Map, Value, json};
+use ghaf_device_manager::{
+    client::{Transport, listen, request, running_in_vm},
+    protocol::{Action, PciSelector, UsbSelector},
+};
+use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum TransportKind {
@@ -56,7 +59,7 @@ enum Command {
 }
 
 #[derive(Clone, Debug, Args)]
-struct UsbSelector {
+struct UsbSelectorArgs {
     #[arg(long = "devnode")]
     device_node: Option<String>,
     #[arg(long)]
@@ -75,13 +78,13 @@ struct UsbSelector {
 enum UsbAction {
     Attach {
         #[command(flatten)]
-        selector: UsbSelector,
+        selector: UsbSelectorArgs,
         #[arg(long)]
         vm: Option<String>,
     },
     Detach {
         #[command(flatten)]
-        selector: UsbSelector,
+        selector: UsbSelectorArgs,
     },
     List {
         #[arg(long, conflicts_with = "disconnected")]
@@ -104,7 +107,7 @@ enum UsbAction {
 }
 
 #[derive(Clone, Debug, Args)]
-struct PciSelector {
+struct PciSelectorArgs {
     #[arg(long)]
     address: Option<String>,
     #[arg(long)]
@@ -119,13 +122,13 @@ struct PciSelector {
 enum PciAction {
     Attach {
         #[command(flatten)]
-        selector: PciSelector,
+        selector: PciSelectorArgs,
         #[arg(long)]
         vm: Option<String>,
     },
     Detach {
         #[command(flatten)]
-        selector: PciSelector,
+        selector: PciSelectorArgs,
     },
     List {
         #[arg(long, conflicts_with = "disconnected")]
@@ -161,64 +164,6 @@ enum VmmAction {
         #[arg(long)]
         require_pci: bool,
     },
-}
-
-fn add_optional(map: &mut Map<String, Value>, key: &str, value: &Option<String>) {
-    if let Some(value) = value {
-        map.insert(key.into(), json!(value));
-    }
-}
-
-fn usb_message(action: &str, selector: &UsbSelector) -> Result<Map<String, Value>> {
-    if selector.device_node.is_none()
-        && selector.bus.zip(selector.port).is_none()
-        && selector.vid.as_ref().zip(selector.pid.as_ref()).is_none()
-        && selector.tag.is_none()
-    {
-        bail!("You must specify either --devnode or --bus and --port or --vid and --pid or --tag");
-    }
-    let mut map = Map::from_iter([("action".into(), json!(action))]);
-    add_optional(&mut map, "device_node", &selector.device_node);
-    add_optional(&mut map, "vid", &selector.vid);
-    add_optional(&mut map, "pid", &selector.pid);
-    add_optional(&mut map, "tag", &selector.tag);
-    if let Some(bus) = selector.bus {
-        map.insert("bus".into(), json!(bus));
-    }
-    if let Some(port) = selector.port {
-        map.insert("port".into(), json!(port));
-    }
-    Ok(map)
-}
-
-fn pci_message(action: &str, selector: &PciSelector) -> Result<Map<String, Value>> {
-    if selector.address.is_none()
-        && selector.vid.as_ref().zip(selector.did.as_ref()).is_none()
-        && selector.tag.is_none()
-    {
-        bail!("You must specify either --address or --vid and --did or --tag");
-    }
-    let mut map = Map::from_iter([("action".into(), json!(action))]);
-    add_optional(&mut map, "address", &selector.address);
-    add_optional(&mut map, "vid", &selector.vid);
-    add_optional(&mut map, "did", &selector.did);
-    add_optional(&mut map, "tag", &selector.tag);
-    Ok(map)
-}
-
-fn list_message(action: &str, connected: bool, disconnected: bool, tag: &Option<String>) -> Value {
-    let disconnected = if connected {
-        Some(false)
-    } else if disconnected {
-        Some(true)
-    } else {
-        None
-    };
-    json!({"action": action, "disconnected": disconnected, "tag": tag})
-}
-
-fn vm_message(action: &str, vm: &Option<String>) -> Value {
-    json!({"action": action, "vm": vm})
 }
 
 fn ensure_ok(response: Value) -> Result<Value> {
@@ -296,6 +241,76 @@ fn print_details(value: &Value) {
     }
 }
 
+impl From<UsbSelectorArgs> for UsbSelector {
+    fn from(value: UsbSelectorArgs) -> Self {
+        match value {
+            UsbSelectorArgs {
+                device_node: Some(device_node),
+                bus: None,
+                port: None,
+                vid: None,
+                pid: None,
+                tag: None,
+            } => Self::DeviceNode { device_node },
+            UsbSelectorArgs {
+                device_node: None,
+                bus: Some(bus),
+                port: Some(port),
+                vid: None,
+                pid: None,
+                tag: None,
+            } => Self::BusPort { bus, port },
+            UsbSelectorArgs {
+                device_node: None,
+                bus: None,
+                port: None,
+                vid: Some(vid),
+                pid: Some(pid),
+                tag: None,
+            } => Self::VidPid { vid, pid },
+            UsbSelectorArgs {
+                device_node: None,
+                bus: None,
+                port: None,
+                vid: None,
+                pid: None,
+                tag: Some(tag),
+            } => Self::Tag { tag },
+            _ => {
+                panic!("invalid USB selector; clap should have enforced mutually exclusive fields")
+            }
+        }
+    }
+}
+
+impl From<PciSelectorArgs> for PciSelector {
+    fn from(value: PciSelectorArgs) -> Self {
+        match value {
+            PciSelectorArgs {
+                address: Some(address),
+                vid: None,
+                did: None,
+                tag: None,
+            } => Self::Address { address },
+            PciSelectorArgs {
+                address: None,
+                vid: Some(vid),
+                did: Some(did),
+                tag: None,
+            } => Self::VidDid { vid, did },
+            PciSelectorArgs {
+                address: None,
+                vid: None,
+                did: None,
+                tag: Some(tag),
+            } => Self::Tag { tag },
+            _ => {
+                panic!("invalid PCI selector; clap should have enforced mutually exclusive fields")
+            }
+        }
+    }
+}
+
 fn transport(cli: &Cli) -> Result<Transport> {
     let transport = match cli.transport.unwrap_or_else(|| {
         if running_in_vm() {
@@ -324,13 +339,13 @@ fn transport(cli: &Cli) -> Result<Transport> {
 
 async fn request_with_retry(
     transport: &Transport,
-    message: Value,
+    message: &Action,
     deadline: Duration,
 ) -> Result<Value> {
     let start = Instant::now();
     loop {
         let remaining = deadline.saturating_sub(start.elapsed());
-        match request(transport, message.clone(), remaining).await {
+        match request(transport, message, remaining).await {
             Ok(response) => return Ok(response),
             Err(_) if start.elapsed() < deadline => {
                 tokio::time::sleep(
@@ -356,20 +371,26 @@ async fn main() {
 async fn run() -> Result<()> {
     let cli = Cli::parse();
     let transport = transport(&cli)?;
-    if matches!(cli.command, Command::Listen) {
+    if matches!(&cli.command, Command::Listen) {
         return listen(&transport, |message| println!("{message}"))
             .await
             .context("notification listener failed");
     }
-    let (message, deadline, output) = match &cli.command {
+    let command = cli.command;
+    let (message, deadline, output) = match command {
         Command::Usb { action } => match action {
-            UsbAction::Attach { selector, vm } => {
-                let mut message = usb_message("usb_attach", selector)?;
-                add_optional(&mut message, "vm", vm);
-                (Value::Object(message), Duration::from_secs(10), None)
-            }
+            UsbAction::Attach { selector, vm } => (
+                Action::UsbAttach {
+                    selector: selector.into(),
+                    vm,
+                },
+                Duration::from_secs(10),
+                None,
+            ),
             UsbAction::Detach { selector } => (
-                Value::Object(usb_message("usb_detach", selector)?),
+                Action::UsbDetach {
+                    selector: selector.into(),
+                },
                 Duration::from_secs(10),
                 None,
             ),
@@ -379,25 +400,35 @@ async fn run() -> Result<()> {
                 short,
                 tag,
             } => (
-                list_message("usb_list", *connected, *disconnected, tag),
+                Action::UsbList {
+                    disconnected: if connected {
+                        Some(false)
+                    } else if disconnected {
+                        Some(true)
+                    } else {
+                        None
+                    },
+                    tag,
+                },
                 Duration::from_secs(10),
-                Some(("usb", *short)),
+                Some(("usb", short)),
             ),
-            UsbAction::Suspend { vm } => {
-                (vm_message("usb_suspend", vm), Duration::from_secs(10), None)
-            }
-            UsbAction::Resume { vm } => {
-                (vm_message("usb_resume", vm), Duration::from_secs(10), None)
-            }
+            UsbAction::Suspend { vm } => (Action::UsbSuspend { vm }, Duration::from_secs(10), None),
+            UsbAction::Resume { vm } => (Action::UsbResume { vm }, Duration::from_secs(10), None),
         },
         Command::Pci { action } => match action {
-            PciAction::Attach { selector, vm } => {
-                let mut message = pci_message("pci_attach", selector)?;
-                add_optional(&mut message, "vm", vm);
-                (Value::Object(message), Duration::from_secs(10), None)
-            }
+            PciAction::Attach { selector, vm } => (
+                Action::PciAttach {
+                    selector: selector.into(),
+                    vm,
+                },
+                Duration::from_secs(10),
+                None,
+            ),
             PciAction::Detach { selector } => (
-                Value::Object(pci_message("pci_detach", selector)?),
+                Action::PciDetach {
+                    selector: selector.into(),
+                },
                 Duration::from_secs(10),
                 None,
             ),
@@ -407,16 +438,21 @@ async fn run() -> Result<()> {
                 short,
                 tag,
             } => (
-                list_message("pci_list", *connected, *disconnected, tag),
+                Action::PciList {
+                    disconnected: if connected {
+                        Some(false)
+                    } else if disconnected {
+                        Some(true)
+                    } else {
+                        None
+                    },
+                    tag,
+                },
                 Duration::from_secs(10),
-                Some(("pci", *short)),
+                Some(("pci", short)),
             ),
-            PciAction::Suspend { vm } => {
-                (vm_message("pci_suspend", vm), Duration::from_secs(10), None)
-            }
-            PciAction::Resume { vm } => {
-                (vm_message("pci_resume", vm), Duration::from_secs(10), None)
-            }
+            PciAction::Suspend { vm } => (Action::PciSuspend { vm }, Duration::from_secs(10), None),
+            PciAction::Resume { vm } => (Action::PciResume { vm }, Duration::from_secs(10), None),
         },
         Command::Vmm {
             action:
@@ -428,27 +464,26 @@ async fn run() -> Result<()> {
                     require_pci,
                 },
         } => (
-            json!({
-                "action": "vmm_args",
-                "vm": vm,
-                "qemu_bus_prefix": qemu_bus_prefix,
-                "qemu_bus_start_index": qemu_bus_start_index,
-                "require_pci": require_pci,
-            }),
+            Action::VmmArgs {
+                vm,
+                qemu_bus_prefix,
+                qemu_bus_start_index,
+                require_pci,
+            },
             {
-                if !timeout.is_finite() || *timeout < 0.0 {
+                if !timeout.is_finite() || timeout < 0.0 {
                     bail!("VMM argument timeout must be a finite non-negative number");
                 }
-                Duration::from_secs_f64(*timeout)
+                Duration::from_secs_f64(timeout)
             },
             Some(("vmm", true)),
         ),
         Command::Listen => unreachable!(),
     };
     let response = ensure_ok(if matches!(output, Some(("vmm", _))) {
-        request_with_retry(&transport, message, deadline).await?
+        request_with_retry(&transport, &message, deadline).await?
     } else {
-        request(&transport, message, deadline).await?
+        request(&transport, &message, deadline).await?
     })?;
     match output {
         Some(("usb", short)) => print_usb(&response, short),

@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, UnixListener},
@@ -21,10 +21,7 @@ use tokio_util::codec::{Framed, LinesCodec};
 use tokio_vsock::{VMADDR_CID_ANY, VsockAddr, VsockListener};
 use tracing::{info, warn};
 
-use crate::{
-    crosvm::CommandRunner,
-    manager::{DeviceManager, request_selector},
-};
+use crate::{crosvm::CommandRunner, manager::DeviceManager, protocol::Action};
 
 const MAX_MESSAGE: usize = 1024 * 1024;
 
@@ -166,26 +163,24 @@ where
         return false;
     };
     let response = match line {
-        Ok(line) => match serde_json::from_str::<Value>(&line) {
-            Ok(Value::Object(message)) => {
-                if message.get("action").and_then(Value::as_str) == Some("enable_notifications") {
+        Ok(line) => match serde_json::from_str::<Action>(&line) {
+            Ok(message) => {
+                if matches!(&message, Action::EnableNotifications) {
                     *notifications = true;
                 }
                 handle(manager, message).await
             }
-            Ok(_) => json!({"result": "failed", "error": "API message must be a JSON object"}),
-            Err(error) => json!({"result": "failed", "error": format!("Invalid JSON: {error}")}),
+            Err(error) => {
+                json!({"result": "failed", "error": format!("Invalid API message: {error}")})
+            }
         },
         Err(error) => json!({"result": "failed", "error": format!("Invalid API message: {error}")}),
     };
     framed.send(response.to_string()).await.is_ok()
 }
 
-pub async fn handle<R: CommandRunner>(
-    manager: &DeviceManager<R>,
-    message: Map<String, Value>,
-) -> Value {
-    match handle_inner(manager, &message).await {
+pub async fn handle<R: CommandRunner>(manager: &DeviceManager<R>, message: Action) -> Value {
+    match handle_inner(manager, message).await {
         Ok(value) => value,
         Err(error) => json!({"result": "failed", "error": error.to_string()}),
     }
@@ -193,65 +188,55 @@ pub async fn handle<R: CommandRunner>(
 
 async fn handle_inner<R: CommandRunner>(
     manager: &DeviceManager<R>,
-    message: &Map<String, Value>,
+    message: Action,
 ) -> Result<Value> {
-    let action = message
-        .get("action")
-        .and_then(Value::as_str)
-        .context("No action specified")?;
-    let selector = request_selector(message);
-    let vm = message.get("vm").and_then(Value::as_str);
-    let disconnected = message.get("disconnected").and_then(Value::as_bool);
-    let tag = message.get("tag").and_then(Value::as_str);
-    match action {
-        "enable_notifications" => Ok(json!({"result": "ok"})),
-        "usb_list" => {
-            Ok(json!({"result": "ok", "usb_devices": manager.usb_list(disconnected, tag).await?}))
-        }
-        "usb_attach" => {
-            manager.attach_usb(&selector, vm).await?;
+    match message {
+        Action::EnableNotifications => Ok(json!({"result": "ok"})),
+        Action::UsbList { disconnected, tag } => Ok(
+            json!({"result": "ok", "usb_devices": manager.usb_list(disconnected, tag.as_deref()).await?}),
+        ),
+        Action::UsbAttach { selector, vm } => {
+            let selector: crate::manager::Selector = selector.into();
+            manager.attach_usb(&selector, vm.as_deref()).await?;
             Ok(json!({"result": "ok"}))
         }
-        "usb_detach" => {
+        Action::UsbDetach { selector } => {
+            let selector: crate::manager::Selector = selector.into();
             manager.detach_usb(&selector, true).await?;
             Ok(json!({"result": "ok"}))
         }
-        "usb_suspend" => {
-            manager.suspend_usb(vm).await?;
+        Action::UsbSuspend { vm } => {
+            manager.suspend_usb(vm.as_deref()).await?;
             Ok(json!({"result": "ok"}))
         }
-        "usb_resume" => {
-            manager.resume_usb(vm).await?;
+        Action::UsbResume { vm } => {
+            manager.resume_usb(vm.as_deref()).await?;
             Ok(json!({"result": "ok"}))
         }
-        "pci_list" => {
-            Ok(json!({"result": "ok", "pci_devices": manager.pci_list(disconnected, tag).await?}))
-        }
-        "pci_attach" => {
-            manager.attach_pci(&selector, vm).await?;
+        Action::PciList { disconnected, tag } => Ok(
+            json!({"result": "ok", "pci_devices": manager.pci_list(disconnected, tag.as_deref()).await?}),
+        ),
+        Action::PciAttach { selector, vm } => {
+            let selector: crate::manager::Selector = selector.into();
+            manager.attach_pci(&selector, vm.as_deref()).await?;
             Ok(json!({"result": "ok"}))
         }
-        "pci_detach" => {
+        Action::PciDetach { selector } => {
+            let selector: crate::manager::Selector = selector.into();
             manager.detach_pci(&selector, true).await?;
             Ok(json!({"result": "ok"}))
         }
-        "pci_suspend" => {
-            manager.suspend_pci(vm).await?;
+        Action::PciSuspend { vm } => {
+            manager.suspend_pci(vm.as_deref()).await?;
             Ok(json!({"result": "ok"}))
         }
-        "pci_resume" => {
-            manager.resume_pci(vm).await?;
+        Action::PciResume { vm } => {
+            manager.resume_pci(vm.as_deref()).await?;
             Ok(json!({"result": "ok"}))
         }
-        "vmm_args" => {
-            let vm = vm.context("VM name is required")?;
-            let require_pci = message
-                .get("require_pci")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            Ok(json!({"result": "ok", "vmm_args": manager.vmm_args(vm, require_pci)?}))
-        }
-        _ => Ok(json!({"result": "failed", "error": format!("Unknown message: {action}")})),
+        Action::VmmArgs {
+            vm, require_pci, ..
+        } => Ok(json!({"result": "ok", "vmm_args": manager.vmm_args(&vm, require_pci)?})),
     }
 }
 

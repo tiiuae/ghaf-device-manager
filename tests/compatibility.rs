@@ -13,7 +13,7 @@ use std::{
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use ghaf_device_manager::{
-    CommandRunner, Config, DeviceManager, Selector, api,
+    Action, CommandRunner, Config, DeviceManager, PciSelector, Selector, UsbSelector, api,
     client::{Transport, request},
     crosvm::Output,
 };
@@ -168,7 +168,10 @@ async fn usb_list_preserves_widget_fields() {
     let manager = manager(&dir, None);
     let response = api::handle(
         &manager,
-        json!({"action": "usb_list"}).as_object().unwrap().clone(),
+        Action::UsbList {
+            disconnected: None,
+            tag: None,
+        },
     )
     .await;
     assert_eq!(response["result"], "ok");
@@ -186,10 +189,10 @@ async fn pci_list_preserves_cli_fields_and_tag_filter() {
     let manager = manager(&dir, None);
     let response = api::handle(
         &manager,
-        json!({"action": "pci_list", "tag": "audio"})
-            .as_object()
-            .unwrap()
-            .clone(),
+        Action::PciList {
+            disconnected: None,
+            tag: Some("audio".to_owned()),
+        },
     )
     .await;
     let device = &response["pci_devices"][0];
@@ -204,21 +207,10 @@ async fn pci_list_preserves_cli_fields_and_tag_filter() {
 async fn protocol_returns_legacy_failure_shape() {
     let dir = tempfile::tempdir().unwrap();
     let manager = manager(&dir, None);
-    let missing = api::handle(&manager, Default::default()).await;
-    assert_eq!(missing["result"], "failed");
-    assert_eq!(missing["error"], "No action specified");
-    let unknown = api::handle(
-        &manager,
-        json!({"action": "no_such_action"})
-            .as_object()
-            .unwrap()
-            .clone(),
-    )
-    .await;
-    assert_eq!(
-        unknown,
-        json!({"result": "failed", "error": "Unknown message: no_such_action"})
-    );
+    assert!(serde_json::from_value::<Action>(json!({})).is_err());
+    assert!(serde_json::from_value::<Action>(json!({"action": "no_such_action"})).is_err());
+    let response = api::handle(&manager, Action::EnableNotifications).await;
+    assert_eq!(response, json!({"result": "ok"}));
 }
 
 #[test]
@@ -287,7 +279,10 @@ async fn unix_wire_protocol_is_newline_delimited_json() {
         &Transport::Unix {
             path: socket.to_string_lossy().into_owned(),
         },
-        json!({"action": "usb_list"}),
+        &Action::UsbList {
+            disconnected: None,
+            tag: None,
+        },
         Duration::from_secs(1),
     )
     .await
@@ -295,6 +290,70 @@ async fn unix_wire_protocol_is_newline_delimited_json() {
     assert_eq!(response["result"], "ok");
     assert_eq!(response["usb_devices"][0]["product_name"], "USB Receiver");
     server.abort();
+}
+
+#[test]
+fn protocol_serialization_matches_previous_wire_shape() {
+    assert_eq!(
+        serde_json::to_value(Action::EnableNotifications).unwrap(),
+        json!({"action": "enable_notifications"})
+    );
+    assert_eq!(
+        serde_json::to_value(Action::UsbAttach {
+            selector: UsbSelector::DeviceNode {
+                device_node: "/dev/bus/usb/001/004".to_owned(),
+            },
+            vm: Some("gui-vm".to_owned()),
+        })
+        .unwrap(),
+        json!({
+            "action": "usb_attach",
+            "device_node": "/dev/bus/usb/001/004",
+            "vm": "gui-vm"
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(Action::PciList {
+            disconnected: Some(true),
+            tag: Some("audio".to_owned()),
+        })
+        .unwrap(),
+        json!({
+            "action": "pci_list",
+            "disconnected": true,
+            "tag": "audio"
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(Action::PciAttach {
+            selector: PciSelector::Address {
+                address: "0000:00:1f.3".to_owned(),
+            },
+            vm: None,
+        })
+        .unwrap(),
+        json!({
+            "action": "pci_attach",
+            "address": "0000:00:1f.3",
+            "vm": null
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(Action::VmmArgs {
+            vm: "audio-vm".to_owned(),
+            qemu_bus_prefix: None,
+            qemu_bus_start_index: Some(3),
+            require_pci: true,
+        })
+        .unwrap(),
+        json!({
+            "action": "vmm_args",
+            "vm": "audio-vm",
+            "qemu_bus_prefix": null,
+            "qemu_bus_start_index": 3,
+            "require_pci": true
+        })
+    );
 }
 
 #[test]
