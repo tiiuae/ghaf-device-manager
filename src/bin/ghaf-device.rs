@@ -7,7 +7,9 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ghaf_device_manager::{
     client::{Transport, listen, request, running_in_vm},
-    protocol::{Action, PciSelector, Response, ResponsePayload, UsbSelector},
+    protocol::{
+        Action, PciListDevice, PciSelector, Response, ResponsePayload, UsbListDevice, UsbSelector,
+    },
 };
 use serde_json::Value;
 
@@ -217,43 +219,41 @@ fn ensure_ok(response: Response) -> Result<ResponsePayload> {
     }
 }
 
-fn print_usb(devices: &[Value], short: bool) {
+fn print_usb(devices: &[UsbListDevice], short: bool) {
     for device in devices {
         println!(
             "{}:{} {} {}",
-            text(device, "vid"),
-            text(device, "pid"),
-            text(device, "vendor_name"),
-            text(device, "product_name")
+            opt_text(device.device.vid.as_deref()),
+            opt_text(device.device.pid.as_deref()),
+            opt_text(device.device.vendor_name.as_deref()),
+            opt_text(device.device.product_name.as_deref())
         );
         if !short {
-            print_details(device);
+            let details = serde_json::to_value(device).expect("USB list device should serialize");
+            print_details(&details);
         }
     }
 }
 
-fn print_pci(devices: &[Value], short: bool) {
+fn print_pci(devices: &[PciListDevice], short: bool) {
     for device in devices {
         println!(
             "{} {}:{} {} {}",
-            text(device, "address"),
-            text(device, "vid"),
-            text(device, "did"),
-            text(device, "vendor_name"),
-            text(device, "device_name")
+            &device.device.address,
+            opt_text(device.device.vendor_id_text.as_deref()),
+            opt_text(device.device.device_id_text.as_deref()),
+            opt_text(device.device.vendor_name.as_deref()),
+            opt_text(device.device.device_name.as_deref())
         );
         if !short {
-            print_details(device);
+            let details = serde_json::to_value(device).expect("PCI list device should serialize");
+            print_details(&details);
         }
     }
 }
 
-fn text(value: &Value, key: &str) -> String {
-    value
-        .get(key)
-        .and_then(Value::as_str)
-        .unwrap_or("None")
-        .to_owned()
+fn opt_text(value: Option<&str>) -> &str {
+    value.unwrap_or("None")
 }
 
 fn print_details(value: &Value) {

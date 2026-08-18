@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
+use crate::device::{PciDevice, UsbDevice};
 use crate::manager::Selector;
 
 #[derive(Serialize, Deserialize)]
@@ -82,12 +82,12 @@ pub struct EmptyResponse;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UsbListResponse {
-    pub usb_devices: Vec<Value>,
+    pub usb_devices: Vec<UsbListDevice>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PciListResponse {
-    pub pci_devices: Vec<Value>,
+    pub pci_devices: Vec<PciListDevice>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -95,7 +95,26 @@ pub struct VmmArgsResponse {
     pub vmm_args: Vec<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UsbListDevice {
+    #[serde(flatten)]
+    pub device: UsbDevice,
+    pub allowed_vms: Vec<String>,
+    pub vm: Option<String>,
+    pub disconnected: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PciListDevice {
+    #[serde(flatten)]
+    pub device: PciDevice,
+    pub allowed_vms: Vec<String>,
+    pub vm: Option<String>,
+    pub disconnected: bool,
+}
+
 impl ResponsePayload {
+    #[must_use]
     pub fn empty() -> Self {
         Self::Empty(EmptyResponse)
     }
@@ -164,6 +183,7 @@ impl From<PciSelector> for Selector {
 }
 
 impl Response {
+    #[must_use]
     pub fn ok(payload: ResponsePayload) -> Self {
         Self::Ok { payload }
     }

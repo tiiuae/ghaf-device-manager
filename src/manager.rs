@@ -20,6 +20,7 @@ use crate::{
     crosvm::{CommandRunner, Crosvm, bind_vfio},
     device::{PciDevice, UsbDevice, iommu_group, scan_pci, scan_usb},
     state::{State, UsbPortBinding},
+    protocol::{PciListDevice, UsbListDevice},
 };
 
 #[derive(Clone, Debug, Default)]
@@ -121,7 +122,7 @@ impl<R: CommandRunner> DeviceManager<R> {
         &self,
         disconnected: Option<bool>,
         tag: Option<&str>,
-    ) -> Result<Vec<Value>> {
+    ) -> Result<Vec<UsbListDevice>> {
         let state = self.state.lock().await;
         let mut output = Vec::new();
         for (device, rule) in self.usb_devices()? {
@@ -131,20 +132,15 @@ impl<R: CommandRunner> DeviceManager<R> {
             {
                 continue;
             }
-            let mut object = serde_json::to_value(&device)?
-                .as_object()
-                .cloned()
-                .unwrap_or_default();
-            object.insert("allowed_vms".into(), json!(allowed_vms(&rule)));
-            object.insert(
-                "vm".into(),
-                state
-                    .usb_vms
-                    .get(device.device_node.as_deref().unwrap_or_default())
-                    .map_or(Value::Null, |vm| json!(vm)),
-            );
-            object.insert("disconnected".into(), json!(is_disconnected));
-            output.push(Value::Object(object));
+            let device_node = device.device_node.clone();
+            output.push(UsbListDevice {
+                device,
+                allowed_vms: allowed_vms(&rule),
+                vm: device_node
+                    .as_deref()
+                    .and_then(|node| state.usb_vms.get(node).cloned()),
+                disconnected: is_disconnected,
+            });
         }
         Ok(output)
     }
@@ -153,7 +149,7 @@ impl<R: CommandRunner> DeviceManager<R> {
         &self,
         disconnected: Option<bool>,
         tag: Option<&str>,
-    ) -> Result<Vec<Value>> {
+    ) -> Result<Vec<PciListDevice>> {
         let state = self.state.lock().await;
         let mut output = Vec::new();
         for (device, rule) in self.pci_devices()? {
@@ -163,20 +159,13 @@ impl<R: CommandRunner> DeviceManager<R> {
             {
                 continue;
             }
-            let mut object = serde_json::to_value(&device)?
-                .as_object()
-                .cloned()
-                .unwrap_or_default();
-            object.insert("allowed_vms".into(), json!(allowed_vms(&rule)));
-            object.insert(
-                "vm".into(),
-                state
-                    .pci_vms
-                    .get(&device.address)
-                    .map_or(Value::Null, |vm| json!(vm)),
-            );
-            object.insert("disconnected".into(), json!(is_disconnected));
-            output.push(Value::Object(object));
+            let address = device.address.clone();
+            output.push(PciListDevice {
+                device,
+                allowed_vms: allowed_vms(&rule),
+                vm: state.pci_vms.get(&address).cloned(),
+                disconnected: is_disconnected,
+            });
         }
         Ok(output)
     }

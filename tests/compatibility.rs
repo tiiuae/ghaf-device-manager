@@ -443,7 +443,7 @@ async fn selected_usb_attach_completes_and_updates_legacy_list_fields() {
     .unwrap()
     .unwrap();
     let list = manager.usb_list(Some(false), None).await.unwrap();
-    assert_eq!(list[0]["vm"], "gui-vm");
+    assert_eq!(list[0].vm.as_deref(), Some("gui-vm"));
     assert_eq!(
         fs::read_to_string(dir.path().join("state.json")).unwrap(),
         concat!(
