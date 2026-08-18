@@ -115,7 +115,7 @@ pub struct PciListDevice {
 
 impl ResponsePayload {
     #[must_use]
-    pub fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self::Empty(EmptyResponse)
     }
 }
@@ -184,11 +184,11 @@ impl From<PciSelector> for Selector {
 
 impl Response {
     #[must_use]
-    pub fn ok(payload: ResponsePayload) -> Self {
+    pub(crate) fn ok(payload: ResponsePayload) -> Self {
         Self::Ok { payload }
     }
 
-    pub fn failed(error: impl Into<String>) -> Self {
+    pub(crate) fn failed(error: impl Into<String>) -> Self {
         Self::Failed {
             error: error.into(),
         }

@@ -119,6 +119,7 @@ where
 // the kernel reject it with ENOTTY.
 const IOCTL_VM_SOCKETS_GET_LOCAL_CID: libc::c_ulong = nix::request_code_none!(7, 0xb9);
 
+#[must_use]
 pub fn running_in_vm() -> bool {
     let Ok(file) = File::open("/dev/vsock") else {
         return false;

@@ -239,7 +239,7 @@ fn print_pci(devices: &[PciListDevice], short: bool) {
     for device in devices {
         println!(
             "{} {}:{} {} {}",
-            &device.device.address,
+            device.device.address,
             opt_text(device.device.vendor_id_text.as_deref()),
             opt_text(device.device.device_id_text.as_deref()),
             opt_text(device.device.vendor_name.as_deref()),
@@ -261,8 +261,7 @@ fn print_details(value: &Value) {
         for (key, value) in object {
             let value = value
                 .as_str()
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| value.to_string());
+                .map_or_else(|| value.to_string(), ToOwned::to_owned);
             println!("  {key:<16}: {value}");
         }
         println!();

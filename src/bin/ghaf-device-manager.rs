@@ -69,7 +69,7 @@ async fn run() -> Result<()> {
                         break;
                     }
                 }
-                _ = tokio::time::sleep(delay) => {}
+                () = tokio::time::sleep(delay) => {}
             }
             while receiver.try_recv().is_ok() {}
             delay = match reconcile.reconcile().await {
@@ -107,7 +107,7 @@ fn spawn_udev_monitor(sender: mpsc::Sender<()>) -> Result<()> {
             };
             loop {
                 // SAFETY: descriptor points to one initialized pollfd for the duration of the call.
-                if unsafe { libc::poll(&mut descriptor, 1, -1) } <= 0 {
+                if unsafe { libc::poll(&raw mut descriptor, 1, -1) } <= 0 {
                     continue;
                 }
                 let relevant = socket.iter().any(|event| {

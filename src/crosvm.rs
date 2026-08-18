@@ -51,7 +51,7 @@ pub struct Crosvm<R: CommandRunner> {
 }
 
 impl<R: CommandRunner> Crosvm<R> {
-    pub fn new(binary: impl Into<String>, runner: R) -> Self {
+    pub(crate) fn new(binary: impl Into<String>, runner: R) -> Self {
         Self {
             binary: binary.into(),
             runner,
@@ -224,7 +224,7 @@ impl<R: CommandRunner> Crosvm<R> {
     }
 }
 
-pub fn bind_vfio(address: &str, root: &Path) -> Result<()> {
+pub(crate) fn bind_vfio(address: &str, root: &Path) -> Result<()> {
     let device = root.join(address);
     let current_driver = fs_driver(&device);
     if current_driver.as_deref() == Some("vfio-pci") {

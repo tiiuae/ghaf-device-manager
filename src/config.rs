@@ -314,7 +314,7 @@ impl Config {
         let has_valid_interface = device
             .interfaces
             .iter()
-            .any(|interface| !matches!(interface.class, None | Some(0) | Some(0xff)));
+            .any(|interface| !matches!(interface.class, None | Some(0 | 0xff)));
         let Some(pattern) = (!has_valid_interface)
             .then(|| selector.get("driverPath").and_then(Value::as_str))
             .flatten()
@@ -412,14 +412,15 @@ impl Config {
         Ok(())
     }
 
-    pub fn vm(&self, name: &str) -> Result<&Vm> {
+    pub(crate) fn vm(&self, name: &str) -> Result<&Vm> {
         self.vms
             .iter()
             .find(|vm| vm.name == name)
             .with_context(|| format!("VM {name} is not found in the configuration"))
     }
 
-    pub fn usb_rule(&self, device: &UsbDevice) -> Option<RuleMatch> {
+    #[must_use]
+    pub(crate) fn usb_rule(&self, device: &UsbDevice) -> Option<RuleMatch> {
         self.usb_passthrough.iter().find_map(|rule| {
             let target_vm = string(rule, "targetVm");
             let allowed_vms = string_list(rule, "allowedVms");
@@ -439,7 +440,7 @@ impl Config {
         })
     }
 
-    pub fn pci_rule(&self, device: &PciDevice) -> Option<RuleMatch> {
+    pub(crate) fn pci_rule(&self, device: &PciDevice) -> Option<RuleMatch> {
         let mut order = 0;
         for rule in &self.pci_passthrough {
             if !enabled(rule) {
@@ -484,7 +485,8 @@ impl Config {
         None
     }
 
-    pub fn has_pci_rules(&self, vm: &str) -> bool {
+    #[must_use]
+    pub(crate) fn has_pci_rules(&self, vm: &str) -> bool {
         self.pci_passthrough
             .iter()
             .any(|rule| enabled(rule) && rule.get("targetVm").and_then(Value::as_str) == Some(vm))

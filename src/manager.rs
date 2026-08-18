@@ -19,8 +19,8 @@ use crate::{
     config::{Config, RuleMatch},
     crosvm::{CommandRunner, Crosvm, bind_vfio},
     device::{PciDevice, UsbDevice, iommu_group, scan_pci, scan_usb},
-    state::{State, UsbPortBinding},
     protocol::{PciListDevice, UsbListDevice},
+    state::{State, UsbPortBinding},
 };
 
 #[derive(Clone, Debug, Default)]
@@ -65,7 +65,7 @@ impl<R: CommandRunner> DeviceManager<R> {
         pci_root: PathBuf,
     ) -> Result<Self> {
         config.validate()?;
-        let state = State::load(config.general.persistency, &config.general.state_path)?;
+        let state = State::load(config.general.persistency, &config.general.state_path);
         let (notifications, _) = broadcast::channel(128);
         let binary = config.general.crosvm.clone();
         Ok(Self {
@@ -145,7 +145,7 @@ impl<R: CommandRunner> DeviceManager<R> {
         Ok(output)
     }
 
-    pub async fn pci_list(
+    pub(crate) async fn pci_list(
         &self,
         disconnected: Option<bool>,
         tag: Option<&str>,
@@ -252,7 +252,7 @@ impl<R: CommandRunner> DeviceManager<R> {
                 failures.push(format!("{}: {error}", device.sys_name));
             }
         }
-        aggregate(failures)
+        aggregate(&failures)
     }
 
     async fn attach_one_usb(
@@ -347,7 +347,7 @@ impl<R: CommandRunner> DeviceManager<R> {
         Ok(())
     }
 
-    pub async fn detach_usb(&self, selector: &Selector, permanent: bool) -> Result<()> {
+    pub(crate) async fn detach_usb(&self, selector: &Selector, permanent: bool) -> Result<()> {
         let _operation = self.operation.lock().await;
         let devices = self.selected_usb(selector)?;
         let mut failures = Vec::new();
@@ -356,7 +356,7 @@ impl<R: CommandRunner> DeviceManager<R> {
                 failures.push(format!("{}: {error}", device.sys_name));
             }
         }
-        aggregate(failures)
+        aggregate(&failures)
     }
 
     async fn detach_one_usb(&self, device: &UsbDevice, permanent: bool) -> Result<()> {
@@ -433,7 +433,11 @@ impl<R: CommandRunner> DeviceManager<R> {
         Ok(())
     }
 
-    pub async fn attach_pci(&self, selector: &Selector, requested_vm: Option<&str>) -> Result<()> {
+    pub(crate) async fn attach_pci(
+        &self,
+        selector: &Selector,
+        requested_vm: Option<&str>,
+    ) -> Result<()> {
         let _operation = self.operation.lock().await;
         let devices = self.selected_pci(selector)?;
         let mut failures = Vec::new();
@@ -442,7 +446,7 @@ impl<R: CommandRunner> DeviceManager<R> {
                 failures.push(format!("{}: {error}", device.address));
             }
         }
-        aggregate(failures)
+        aggregate(&failures)
     }
 
     async fn attach_one_pci(
@@ -499,7 +503,7 @@ impl<R: CommandRunner> DeviceManager<R> {
         Ok(())
     }
 
-    pub async fn detach_pci(&self, selector: &Selector, permanent: bool) -> Result<()> {
+    pub(crate) async fn detach_pci(&self, selector: &Selector, permanent: bool) -> Result<()> {
         let _operation = self.operation.lock().await;
         let devices = self.selected_pci(selector)?;
         let mut failures = Vec::new();
@@ -508,7 +512,7 @@ impl<R: CommandRunner> DeviceManager<R> {
                 failures.push(format!("{}: {error}", device.address));
             }
         }
-        aggregate(failures)
+        aggregate(&failures)
     }
 
     async fn detach_one_pci(
@@ -558,7 +562,7 @@ impl<R: CommandRunner> DeviceManager<R> {
         Ok(())
     }
 
-    pub async fn suspend_usb(&self, vm: Option<&str>) -> Result<()> {
+    pub(crate) async fn suspend_usb(&self, vm: Option<&str>) -> Result<()> {
         let _operation = self.operation.lock().await;
         let devices = self
             .usb_devices()?
@@ -582,10 +586,10 @@ impl<R: CommandRunner> DeviceManager<R> {
                 failures.push(format!("{}: {error}", device.sys_name));
             }
         }
-        aggregate(failures)
+        aggregate(&failures)
     }
 
-    pub async fn suspend_pci(&self, vm: Option<&str>) -> Result<()> {
+    pub(crate) async fn suspend_pci(&self, vm: Option<&str>) -> Result<()> {
         let _operation = self.operation.lock().await;
         let devices = self
             .pci_devices()?
@@ -609,7 +613,7 @@ impl<R: CommandRunner> DeviceManager<R> {
                 failures.push(format!("{}: {error}", device.address));
             }
         }
-        aggregate(failures)
+        aggregate(&failures)
     }
 
     pub async fn resume_usb(&self, vm: Option<&str>) -> Result<()> {
@@ -647,10 +651,10 @@ impl<R: CommandRunner> DeviceManager<R> {
                 failures.push(format!("{}: {error}", device.sys_name));
             }
         }
-        aggregate(failures)
+        aggregate(&failures)
     }
 
-    pub async fn resume_pci(&self, vm: Option<&str>) -> Result<()> {
+    pub(crate) async fn resume_pci(&self, vm: Option<&str>) -> Result<()> {
         let _operation = self.operation.lock().await;
         let devices = self.pci_devices()?;
         let mut failures = Vec::new();
@@ -674,7 +678,7 @@ impl<R: CommandRunner> DeviceManager<R> {
                 failures.push(format!("{}: {error}", device.address));
             }
         }
-        aggregate(failures)
+        aggregate(&failures)
     }
 
     pub async fn reconcile(&self) -> Result<()> {
@@ -686,7 +690,7 @@ impl<R: CommandRunner> DeviceManager<R> {
         if let Err(error) = self.resume_usb(None).await {
             failures.push(format!("USB: {error}"));
         }
-        aggregate(failures)
+        aggregate(&failures)
     }
 
     async fn observe(&self) -> Result<()> {
@@ -839,7 +843,7 @@ fn allowed_vms(rule: &RuleMatch) -> Vec<String> {
         .collect()
 }
 
-fn aggregate(failures: Vec<String>) -> Result<()> {
+fn aggregate<T: std::borrow::Borrow<str>>(failures: &[T]) -> Result<()> {
     if failures.is_empty() {
         Ok(())
     } else {
@@ -990,7 +994,8 @@ fn chown_named(path: &str, user: Option<&str>, group: Option<&str>) -> Result<()
     Ok(())
 }
 
-pub fn request_selector(message: &Map<String, Value>) -> Selector {
+#[must_use]
+fn request_selector(message: &Map<String, Value>) -> Selector {
     Selector {
         device_node: text(message, "device_node"),
         bus: number(message, "bus"),

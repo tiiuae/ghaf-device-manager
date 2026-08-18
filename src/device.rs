@@ -61,7 +61,8 @@ pub struct UsbDevice {
 }
 
 impl UsbDevice {
-    pub fn persistent_id(&self) -> String {
+    #[must_use]
+    pub(crate) fn persistent_id(&self) -> String {
         format!(
             "usb-{}:{}:{}",
             self.vid.as_deref().unwrap_or("None"),
@@ -94,12 +95,13 @@ pub struct PciDevice {
 }
 
 impl PciDevice {
-    pub fn persistent_id(&self) -> String {
+    #[must_use]
+    pub(crate) fn persistent_id(&self) -> String {
         format!("pci-{}", self.address)
     }
 }
 
-pub fn scan_usb(root: &Path) -> Result<Vec<UsbDevice>> {
+pub(crate) fn scan_usb(root: &Path) -> Result<Vec<UsbDevice>> {
     let protect_host_storage = root == Path::new("/sys/bus/usb/devices");
     let mut devices = Vec::new();
     for entry in fs::read_dir(root).with_context(|| format!("failed to scan {}", root.display()))? {
@@ -307,14 +309,14 @@ fn active_host_storage_device_ids() -> Result<HashSet<String>> {
 }
 
 fn linux_major(device: u64) -> u64 {
-    ((device >> 8) & 0xfff) | ((device >> 32) & 0xfffff000)
+    ((device >> 8) & 0xfff) | ((device >> 32) & 0xffff_f000)
 }
 
 fn linux_minor(device: u64) -> u64 {
-    (device & 0xff) | ((device >> 12) & 0xffffff00)
+    (device & 0xff) | ((device >> 12) & 0xfff_ff00)
 }
 
-pub fn scan_pci(root: &Path) -> Result<Vec<PciDevice>> {
+pub(crate) fn scan_pci(root: &Path) -> Result<Vec<PciDevice>> {
     let mut devices = Vec::new();
     for entry in fs::read_dir(root).with_context(|| format!("failed to scan {}", root.display()))? {
         let entry = entry?;
@@ -349,7 +351,7 @@ pub fn scan_pci(root: &Path) -> Result<Vec<PciDevice>> {
     Ok(devices)
 }
 
-pub fn iommu_group(address: &str, root: &Path) -> Result<Vec<String>> {
+pub(crate) fn iommu_group(address: &str, root: &Path) -> Result<Vec<String>> {
     let link = root.join(address).join("iommu_group");
     if !link.exists() {
         return Ok(Vec::new());

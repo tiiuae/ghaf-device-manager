@@ -37,7 +37,7 @@ pub struct State {
 }
 
 impl State {
-    pub fn load(enabled: bool, path: impl Into<PathBuf>) -> Result<Self> {
+    pub(crate) fn load(enabled: bool, path: impl Into<PathBuf>) -> Self {
         let path = path.into();
         let persistent = if enabled && path.exists() {
             match fs::read_to_string(&path)
@@ -55,23 +55,24 @@ impl State {
         } else {
             PersistentState::default()
         };
-        Ok(Self {
+        Self {
             persistent,
             usb_vms: HashMap::new(),
             pci_vms: HashMap::new(),
             enabled,
             path,
-        })
+        }
     }
 
-    pub fn disconnected(&self, id: &str) -> bool {
+    #[must_use]
+    pub(crate) fn disconnected(&self, id: &str) -> bool {
         self.persistent
             .disconnected_devices
             .iter()
             .any(|item| item == id)
     }
 
-    pub fn set_disconnected(&mut self, id: &str, value: bool) -> Result<()> {
+    pub(crate) fn set_disconnected(&mut self, id: &str, value: bool) -> Result<()> {
         self.persistent
             .disconnected_devices
             .retain(|item| item != id);
@@ -82,14 +83,14 @@ impl State {
         self.save()
     }
 
-    pub fn select_vm(&mut self, id: &str, vm: &str) -> Result<()> {
+    pub(crate) fn select_vm(&mut self, id: &str, vm: &str) -> Result<()> {
         self.persistent
             .selected_vms
             .insert(id.to_owned(), vm.to_owned());
         self.save()
     }
 
-    pub fn save(&self) -> Result<()> {
+    pub(crate) fn save(&self) -> Result<()> {
         if !self.enabled {
             return Ok(());
         }
@@ -125,10 +126,10 @@ mod tests {
             r#"{"selected_vms":{"usb:1-2":"gui-vm"},"disconnected_devices":["pci:0000:00:1f.3"],"crosvm_usb_ports":{}}"#,
         )
         .unwrap();
-        let mut state = State::load(true, &path).unwrap();
+        let mut state = State::load(true, &path);
         assert_eq!(state.persistent.selected_vms["usb:1-2"], "gui-vm");
         state.set_disconnected("pci:0000:00:1f.3", false).unwrap();
-        let reloaded = State::load(true, &path).unwrap();
+        let reloaded = State::load(true, &path);
         assert!(reloaded.persistent.disconnected_devices.is_empty());
     }
 }
