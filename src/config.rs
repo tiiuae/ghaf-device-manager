@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use regex::RegexBuilder;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::device::{PciDevice, UsbDevice};
@@ -43,8 +43,18 @@ pub struct Config {
 pub struct Vm {
     pub name: String,
     #[serde(rename = "type")]
-    pub vm_type: String,
+    pub vm_type: VmType,
     pub socket: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VmType {
+    Crosvm,
+    #[allow(dead_code)]
+    Qemu,
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -358,7 +368,7 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.vms.iter().any(|vm| vm.vm_type != "crosvm") {
+        if self.vms.iter().any(|vm| vm.vm_type != VmType::Crosvm) {
             bail!("ghaf-device-manager supports only Crosvm VMs");
         }
         let mut names = HashMap::new();
