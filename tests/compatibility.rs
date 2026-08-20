@@ -3,6 +3,7 @@
 
 use std::{
     collections::VecDeque,
+    ffi::OsStr,
     fs,
     os::unix::fs::symlink,
     path::Path,
@@ -25,7 +26,15 @@ struct NoCommands;
 
 #[async_trait]
 impl CommandRunner for NoCommands {
-    async fn run(&self, _: &str, args: &[String], _: Duration) -> Result<Output> {
+    async fn run<I, A>(&self, _: &Path, args: I, _: Duration) -> Result<Output>
+    where
+        I: IntoIterator<Item = A> + Send,
+        A: AsRef<OsStr> + Send,
+    {
+        let args = args
+            .into_iter()
+            .map(|arg| arg.as_ref().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
         bail!("unexpected command: {args:?}")
     }
 }
@@ -37,7 +46,15 @@ struct ScriptedCommands {
 
 #[async_trait]
 impl CommandRunner for ScriptedCommands {
-    async fn run(&self, _: &str, args: &[String], _: Duration) -> Result<Output> {
+    async fn run<I, A>(&self, _: &Path, args: I, _: Duration) -> Result<Output>
+    where
+        I: IntoIterator<Item = A> + Send,
+        A: AsRef<OsStr> + Send,
+    {
+        let args = args
+            .into_iter()
+            .map(|arg| arg.as_ref().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
         self.outputs
             .lock()
             .unwrap()
@@ -54,8 +71,16 @@ struct RecordingCommands {
 
 #[async_trait]
 impl CommandRunner for RecordingCommands {
-    async fn run(&self, _: &str, args: &[String], _: Duration) -> Result<Output> {
-        self.calls.lock().unwrap().push(args.to_vec());
+    async fn run<I, A>(&self, _: &Path, args: I, _: Duration) -> Result<Output>
+    where
+        I: IntoIterator<Item = A> + Send,
+        A: AsRef<OsStr> + Send,
+    {
+        let args = args
+            .into_iter()
+            .map(|arg| arg.as_ref().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        self.calls.lock().unwrap().push(args.clone());
         self.outputs
             .lock()
             .unwrap()

@@ -44,7 +44,7 @@ pub struct Vm {
     pub name: String,
     #[serde(rename = "type")]
     pub vm_type: String,
-    pub socket: String,
+    pub socket: PathBuf,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -363,7 +363,7 @@ impl Config {
         }
         let mut names = HashMap::new();
         for vm in &self.vms {
-            if vm.name.is_empty() || vm.socket.is_empty() {
+            if vm.name.is_empty() || vm.socket.as_os_str().is_empty() {
                 bail!("VM name and socket must not be empty");
             }
             if names.insert(&vm.name, &vm.socket).is_some() {

@@ -48,7 +48,7 @@ pub async fn serve<R: CommandRunner + 'static>(manager: Arc<DeviceManager<R>>) -
         match transport {
             ApiTransport::Unix => {
                 let path = &api.unix_socket;
-                if let Some(parent) = Path::new(path).parent() {
+                if let Some(parent) = path.parent() {
                     fs::create_dir_all(parent)?;
                 }
                 if path.exists() {

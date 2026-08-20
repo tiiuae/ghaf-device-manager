@@ -384,10 +384,10 @@ impl<R: CommandRunner> DeviceManager<R> {
         };
         if let Some(vm_name) = vm_name {
             let vm = self.config.vm(&vm_name)?;
-            if !Path::new(&vm.socket).exists() {
+            if !vm.socket.exists() {
                 warn!(
                     vm = %vm_name,
-                    socket = %vm.socket,
+                    socket = %vm.socket.display(),
                     "VM socket is absent; clearing stale USB attachment state"
                 );
             } else if let Some(binding) = binding.filter(|binding| {
@@ -538,14 +538,14 @@ impl<R: CommandRunner> DeviceManager<R> {
             } else {
                 vec![device.address.clone()]
             };
-            if Path::new(&vm.socket).exists() {
+            if vm.socket.exists() {
                 for address in &detach {
                     self.crosvm.vfio_remove(&vm.socket, address).await?;
                 }
             } else {
                 warn!(
                     vm = %vm_name,
-                    socket = %vm.socket,
+                    socket = %vm.socket.display(),
                     "VM socket is absent; clearing stale PCI attachment state"
                 );
             }
@@ -852,7 +852,7 @@ fn aggregate<T: std::borrow::Borrow<str>>(failures: &[T]) -> Result<()> {
     }
 }
 
-fn socket_generation(path: &str) -> Option<String> {
+fn socket_generation(path: &Path) -> Option<String> {
     let metadata = fs::metadata(path).ok()?;
     Some(format!(
         "{}:{}:{}",
