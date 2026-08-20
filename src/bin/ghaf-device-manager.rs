@@ -58,7 +58,7 @@ async fn run() -> Result<()> {
         false
     };
     let (events, mut receiver) = mpsc::channel::<()>(8);
-    spawn_udev_monitor(events).await?;
+    spawn_udev_monitor(events)?;
     let reconcile = Arc::clone(&manager);
     let event_task = tokio::spawn(async move {
         let mut delay = if initial_reconcile_succeeded {
@@ -93,7 +93,7 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
-async fn spawn_udev_monitor(sender: mpsc::Sender<()>) -> Result<()> {
+fn spawn_udev_monitor(sender: mpsc::Sender<()>) -> Result<()> {
     let socket = udev::MonitorBuilder::new()?.listen()?;
     let mut socket = AsyncFd::new(socket)?;
     tokio::task::spawn_local(async move {

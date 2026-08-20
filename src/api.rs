@@ -52,12 +52,12 @@ pub async fn serve<R: CommandRunner + 'static>(manager: Arc<DeviceManager<R>>) -
                     fs::create_dir_all(parent)?;
                 }
                 if path.exists() {
-                    fs::remove_file(&path)?;
+                    fs::remove_file(path)?;
                 }
-                let listener = UnixListener::bind(&path)
+                let listener = UnixListener::bind(path)
                     .with_context(|| format!("failed to bind Unix socket {}", path.display()))?;
                 configure_unix_socket(
-                    &path,
+                    path,
                     api.unix_socket_user.as_deref(),
                     api.unix_socket_group.as_deref(),
                     api.unix_socket_mode.as_deref(),
@@ -71,7 +71,7 @@ pub async fn serve<R: CommandRunner + 'static>(manager: Arc<DeviceManager<R>>) -
                 });
             }
             ApiTransport::Tcp => {
-                let port = api.port.map_or(Ok(api.tcp_port), |np| np.try_into())?;
+                let port = api.port.map_or(Ok(api.tcp_port), TryFrom::try_from)?;
                 let address = format!("{}:{}", api.host, port);
                 let listener = TcpListener::bind(&address)
                     .await
@@ -133,7 +133,7 @@ where
                                 break;
                             }
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => (),
                         Err(_) => break,
                     }
                 }
