@@ -179,10 +179,7 @@ where
 }
 
 pub async fn handle<R: CommandRunner>(manager: &DeviceManager<R>, message: Action) -> Response {
-    match handle_inner(manager, message).await {
-        Ok(payload) => Response::ok(payload),
-        Err(error) => Response::failed(error.to_string()),
-    }
+    handle_inner(manager, message).await.into()
 }
 
 async fn handle_inner<R: CommandRunner>(

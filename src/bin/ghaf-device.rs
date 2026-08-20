@@ -219,13 +219,6 @@ enum VmmAction {
     },
 }
 
-fn ensure_ok(response: Response) -> Result<ResponsePayload> {
-    match response {
-        Response::Ok { payload } => Ok(payload),
-        Response::Failed { error } => bail!(error),
-    }
-}
-
 fn print_usb(devices: &[UsbListDevice], short: bool) {
     for device in devices {
         println!(
@@ -502,11 +495,12 @@ async fn run() -> Result<()> {
         ),
         Command::Listen => unreachable!(),
     };
-    let response = ensure_ok(if matches!(output, Some(OutputKind::Vmm)) {
+    let response = if matches!(output, Some(OutputKind::Vmm)) {
         request_with_retry(&transport, &message, deadline).await?
     } else {
         request(&transport, &message, deadline).await?
-    })?;
+    }
+    .try_into()?;
     match output {
         Some(OutputKind::Usb { short }) => match response {
             ResponsePayload::UsbList(payload) => print_usb(&payload.usb_devices, short),

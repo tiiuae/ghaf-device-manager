@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 TII (SSRC) and the Ghaf contributors
 // SPDX-License-Identifier: Apache-2.0
 
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::device::{PciDevice, UsbDevice};
@@ -191,6 +192,26 @@ impl Response {
     pub(crate) fn failed(error: impl Into<String>) -> Self {
         Self::Failed {
             error: error.into(),
+        }
+    }
+}
+
+impl TryInto<ResponsePayload> for Response {
+    type Error =  anyhow::Error;
+
+    fn try_into(self) -> Result<ResponsePayload, Self::Error> {
+        match self {
+            Self::Ok { payload } => Ok(payload),
+            Self::Failed { error } => Err(anyhow::anyhow!(error)),
+        }
+    }
+}
+
+impl From<Result<ResponsePayload>> for Response {
+    fn from(result: Result<ResponsePayload>) -> Self {
+        match result {
+            Ok(payload) => Self::ok(payload),
+            Err(error) => Self::failed(error.to_string()),
         }
     }
 }
