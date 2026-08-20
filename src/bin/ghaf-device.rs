@@ -20,6 +20,13 @@ enum TransportKind {
     Vsock,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum OutputKind {
+    Usb { short: bool },
+    Pci { short: bool },
+    Vmm,
+}
+
 #[derive(Debug, Parser)]
 #[command(about = "Manage Ghaf hotplug devices")]
 struct Cli {
@@ -426,7 +433,7 @@ async fn run() -> Result<()> {
                     tag,
                 },
                 Duration::from_secs(10),
-                Some(("usb", short)),
+                Some(OutputKind::Usb { short }),
             ),
             UsbAction::Suspend { vm } => (Action::UsbSuspend { vm }, Duration::from_secs(10), None),
             UsbAction::Resume { vm } => (Action::UsbResume { vm }, Duration::from_secs(10), None),
@@ -464,7 +471,7 @@ async fn run() -> Result<()> {
                     tag,
                 },
                 Duration::from_secs(10),
-                Some(("pci", short)),
+                Some(OutputKind::Pci { short }),
             ),
             PciAction::Suspend { vm } => (Action::PciSuspend { vm }, Duration::from_secs(10), None),
             PciAction::Resume { vm } => (Action::PciResume { vm }, Duration::from_secs(10), None),
@@ -491,25 +498,25 @@ async fn run() -> Result<()> {
                 }
                 Duration::from_secs_f64(timeout)
             },
-            Some(("vmm", true)),
+            Some(OutputKind::Vmm),
         ),
         Command::Listen => unreachable!(),
     };
-    let response = ensure_ok(if matches!(output, Some(("vmm", _))) {
+    let response = ensure_ok(if matches!(output, Some(OutputKind::Vmm)) {
         request_with_retry(&transport, &message, deadline).await?
     } else {
         request(&transport, &message, deadline).await?
     })?;
     match output {
-        Some(("usb", short)) => match response {
+        Some(OutputKind::Usb { short }) => match response {
             ResponsePayload::UsbList(payload) => print_usb(&payload.usb_devices, short),
             other => bail!("unexpected response payload: {other:?}"),
         },
-        Some(("pci", short)) => match response {
+        Some(OutputKind::Pci { short }) => match response {
             ResponsePayload::PciList(payload) => print_pci(&payload.pci_devices, short),
             other => bail!("unexpected response payload: {other:?}"),
         },
-        Some(("vmm", _)) => {
+        Some(OutputKind::Vmm) => {
             let ResponsePayload::VmmArgs(payload) = response else {
                 bail!("unexpected response payload");
             };
