@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use nix::unistd::{Gid, Uid, chown};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use tokio::sync::{Mutex, broadcast};
 use tracing::warn;
 
@@ -971,32 +971,4 @@ fn chown_named(path: &str, user: Option<&str>, group: Option<&str>) -> Result<()
         .map(Gid::from_raw);
     chown(path, uid, gid)?;
     Ok(())
-}
-
-#[must_use]
-fn request_selector(message: &Map<String, Value>) -> Selector {
-    Selector {
-        device_node: text(message, "device_node"),
-        bus: number(message, "bus"),
-        port: number(message, "port"),
-        vid: text(message, "vid"),
-        pid: text(message, "pid"),
-        address: text(message, "address"),
-        did: text(message, "did"),
-        tag: text(message, "tag"),
-    }
-}
-
-fn text(message: &Map<String, Value>, key: &str) -> Option<String> {
-    message
-        .get(key)
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-}
-
-fn number(message: &Map<String, Value>, key: &str) -> Option<u32> {
-    message
-        .get(key)
-        .and_then(Value::as_u64)
-        .and_then(|v| u32::try_from(v).ok())
 }
