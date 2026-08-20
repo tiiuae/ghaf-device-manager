@@ -20,6 +20,7 @@ use tokio_vsock::{VMADDR_CID_ANY, VsockAddr, VsockListener};
 use tracing::{info, warn};
 
 use crate::{
+    config::ApiTransport,
     crosvm::CommandRunner,
     manager::DeviceManager,
     protocol::{
@@ -41,59 +42,54 @@ pub async fn serve<R: CommandRunner + 'static>(manager: Arc<DeviceManager<R>>) -
         return Ok(());
     }
     let transports = api.transports.clone();
-    let mut tasks = JoinSet::new();
+    let mut tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();
     for transport in transports {
-        match transport.as_str() {
-            "unix" => {
-                let path = api.unix_socket.clone();
-                if let Some(parent) = Path::new(&path).parent() {
+        let manager = manager.clone();
+        match transport {
+            ApiTransport::Unix => {
+                let path = &api.unix_socket;
+                if let Some(parent) = Path::new(path).parent() {
                     fs::create_dir_all(parent)?;
                 }
-                if Path::new(&path).exists() {
+                if path.exists() {
                     fs::remove_file(&path)?;
                 }
                 let listener = UnixListener::bind(&path)
-                    .with_context(|| format!("failed to bind Unix socket {path}"))?;
+                    .with_context(|| format!("failed to bind Unix socket {}", path.display()))?;
                 configure_unix_socket(
                     &path,
                     api.unix_socket_user.as_deref(),
                     api.unix_socket_group.as_deref(),
                     api.unix_socket_mode.as_deref(),
                 )?;
-                info!(%path, "API listening on Unix socket");
-                let manager = Arc::clone(&manager);
+                info!(path = %path.display(), "API listening on Unix socket");
                 tasks.spawn(async move {
                     loop {
                         let (stream, _) = listener.accept().await?;
                         tokio::spawn(connection(Arc::clone(&manager), stream));
                     }
-                    #[allow(unreachable_code)]
-                    Ok::<_, anyhow::Error>(())
                 });
             }
-            "tcp" => {
-                let address = format!("{}:{}", api.host, api.port);
+            ApiTransport::Tcp => {
+                let port = api.port.map_or(Ok(api.tcp_port), |np| np.try_into())?;
+                let address = format!("{}:{}", api.host, port);
                 let listener = TcpListener::bind(&address)
                     .await
-                    .with_context(|| format!("failed to bind TCP address {address}"))?;
+                    .with_context(|| format!("failed to bind TCP address {}:{}", api.host, port))?;
                 info!(%address, "API listening on TCP");
-                let manager = Arc::clone(&manager);
                 tasks.spawn(async move {
                     loop {
                         let (stream, _) = listener.accept().await?;
                         tokio::spawn(connection(Arc::clone(&manager), stream));
                     }
-                    #[allow(unreachable_code)]
-                    Ok::<_, anyhow::Error>(())
                 });
             }
-            "vsock" => {
-                let port = api.port;
+            ApiTransport::Vsock => {
+                let port = api.vsock_port;
                 let allowed = api.allowed_cids.clone();
                 let listener = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, port))
                     .with_context(|| format!("failed to bind VSOCK port {port}"))?;
                 info!(port, "API listening on VSOCK");
-                let manager = Arc::clone(&manager);
                 tasks.spawn(async move {
                     loop {
                         let (stream, address) = listener.accept().await?;
@@ -103,11 +99,8 @@ pub async fn serve<R: CommandRunner + 'static>(manager: Arc<DeviceManager<R>>) -
                         }
                         tokio::spawn(connection(Arc::clone(&manager), stream));
                     }
-                    #[allow(unreachable_code)]
-                    Ok::<_, anyhow::Error>(())
                 });
             }
-            other => bail!("unsupported API transport {other}"),
         }
     }
     match tasks.join_next().await {
@@ -249,7 +242,7 @@ async fn handle_inner<R: CommandRunner>(
 }
 
 fn configure_unix_socket(
-    path: &str,
+    path: &Path,
     user: Option<&str>,
     group: Option<&str>,
     mode: Option<&str>,

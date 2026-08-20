@@ -1,7 +1,11 @@
 // SPDX-FileCopyrightText: 2026 TII (SSRC) and the Ghaf contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{path::Path, process::Stdio, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -16,7 +20,7 @@ pub struct Output {
 
 #[async_trait]
 pub trait CommandRunner: Send + Sync {
-    async fn run(&self, program: &str, args: &[String], deadline: Duration) -> Result<Output>;
+    async fn run(&self, program: &Path, args: &[String], deadline: Duration) -> Result<Output>;
 }
 
 #[derive(Debug, Default)]
@@ -24,7 +28,7 @@ pub struct ProcessRunner;
 
 #[async_trait]
 impl CommandRunner for ProcessRunner {
-    async fn run(&self, program: &str, args: &[String], deadline: Duration) -> Result<Output> {
+    async fn run(&self, program: &Path, args: &[String], deadline: Duration) -> Result<Output> {
         let child = Command::new(program)
             .args(args)
             .stdin(Stdio::null())
@@ -32,10 +36,10 @@ impl CommandRunner for ProcessRunner {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .with_context(|| format!("failed to execute {program}"))?;
+            .with_context(|| format!("failed to execute {}", program.display()))?;
         let output = timeout(deadline, child.wait_with_output())
             .await
-            .with_context(|| format!("{program} command timed out"))??;
+            .with_context(|| format!("{} command timed out", program.display()))??;
         Ok(Output {
             status: output.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -45,13 +49,13 @@ impl CommandRunner for ProcessRunner {
 }
 
 pub struct Crosvm<R: CommandRunner> {
-    binary: String,
+    binary: PathBuf,
     runner: R,
     deadline: Duration,
 }
 
 impl<R: CommandRunner> Crosvm<R> {
-    pub(crate) fn new(binary: impl Into<String>, runner: R) -> Self {
+    pub(crate) fn new(binary: impl Into<PathBuf>, runner: R) -> Self {
         Self {
             binary: binary.into(),
             runner,

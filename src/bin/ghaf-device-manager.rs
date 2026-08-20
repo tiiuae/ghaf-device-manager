@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 TII (SSRC) and the Ghaf contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use clap::Parser;
@@ -19,7 +19,7 @@ const RECONCILE_SAFETY_INTERVAL: Duration = Duration::from_secs(30);
 #[command(about = "Crosvm device manager for Ghaf")]
 struct Args {
     #[arg(short, long)]
-    config: String,
+    config: PathBuf,
     #[arg(short = 'a', long = "attach-connected")]
     attach_connected: bool,
     #[arg(short, long)]

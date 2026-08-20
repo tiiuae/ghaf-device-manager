@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
 };
@@ -20,7 +20,8 @@ const DEFAULT_STATE_PATH: &str = "/var/lib/vhotplug/vhotplug.state";
 const DEFAULT_CROSVM: &str = "crosvm";
 const DEFAULT_MODPROBE: &str = "modprobe";
 const DEFAULT_MODINFO: &str = "modinfo";
-const DEFAULT_API_PORT: u32 = 2000;
+const DEFAULT_TCP_PORT: u16 = 2000;
+const DEFAULT_VSOCK_PORT: u32 = 2000;
 const DEFAULT_API_HOST: &str = "127.0.0.1";
 const DEFAULT_UNIX_SOCKET: &str = "/var/lib/vhotplug/vhotplug.sock";
 
@@ -50,10 +51,10 @@ pub struct Vm {
 #[serde(default, rename_all = "camelCase")]
 pub struct General {
     pub persistency: bool,
-    pub state_path: String,
-    pub crosvm: String,
-    pub modprobe: String,
-    pub modinfo: String,
+    pub state_path: PathBuf,
+    pub crosvm: PathBuf,
+    pub modprobe: PathBuf,
+    pub modinfo: PathBuf,
     pub api: Api,
 }
 
@@ -61,24 +62,34 @@ impl Default for General {
     fn default() -> Self {
         Self {
             persistency: true,
-            state_path: DEFAULT_STATE_PATH.to_owned(),
-            crosvm: DEFAULT_CROSVM.to_owned(),
-            modprobe: DEFAULT_MODPROBE.to_owned(),
-            modinfo: DEFAULT_MODINFO.to_owned(),
+            state_path: DEFAULT_STATE_PATH.into(),
+            crosvm: DEFAULT_CROSVM.into(),
+            modprobe: DEFAULT_MODPROBE.into(),
+            modinfo: DEFAULT_MODINFO.into(),
             api: Api::default(),
         }
     }
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApiTransport {
+    Unix,
+    Tcp,
+    Vsock,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Api {
     pub enable: bool,
-    pub transports: Vec<String>,
+    pub transports: Vec<ApiTransport>,
     pub host: String,
-    pub port: u32,
-    pub allowed_cids: Vec<u32>,
-    pub unix_socket: String,
+    pub tcp_port: u16,
+    pub vsock_port: u32,
+    pub port: Option<u32>,
+    pub allowed_cids: HashSet<u32>,
+    pub unix_socket: PathBuf,
     pub unix_socket_user: Option<String>,
     pub unix_socket_group: Option<String>,
     pub unix_socket_mode: Option<String>,
@@ -90,9 +101,11 @@ impl Default for Api {
             enable: true,
             transports: Vec::new(),
             host: DEFAULT_API_HOST.to_owned(),
-            port: DEFAULT_API_PORT,
-            allowed_cids: Vec::new(),
-            unix_socket: DEFAULT_UNIX_SOCKET.to_owned(),
+            tcp_port: DEFAULT_TCP_PORT,
+            vsock_port: DEFAULT_VSOCK_PORT,
+            port: None,
+            allowed_cids: HashSet::new(),
+            unix_socket: DEFAULT_UNIX_SOCKET.into(),
             unix_socket_user: None,
             unix_socket_group: None,
             unix_socket_mode: None,
@@ -356,16 +369,6 @@ impl Config {
             if names.insert(&vm.name, &vm.socket).is_some() {
                 bail!("duplicate VM name {}", vm.name);
             }
-        }
-        for transport in &self.general.api.transports {
-            if !matches!(transport.as_str(), "unix" | "tcp" | "vsock") {
-                bail!("unsupported API transport {transport}");
-            }
-        }
-        if self.general.api.transports.iter().any(|item| item == "tcp")
-            && self.general.api.port > u16::MAX.into()
-        {
-            bail!("TCP API port must be at most {}", u16::MAX);
         }
         Ok(())
     }
