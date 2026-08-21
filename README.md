@@ -35,11 +35,36 @@ trees, MMIO ranges, IRQs, BPMP, DCE, and platform devices remain declarative
 Ghaf and microvm.nix configuration. The `vmm args` action is a compatibility
 renderer and does not make those resources hot-pluggable.
 
+## Security Model
+
+The API is unauthenticated on every transport. Access control is therefore
+entirely a deployment concern:
+
+- **Unix** — the only transport with an access check. The socket is created
+  owner-only and then narrowed or widened by `unixSocketUser`,
+  `unixSocketGroup` and `unixSocketMode`. Grant it to the applet's group, not
+  to everyone.
+- **VSOCK** — reachable by any guest that can open a VSOCK connection to the
+  host. Set `general.api.allowedCids`; an empty list allows every CID.
+- **TCP** — plaintext and unauthenticated. Keep `host` on the loopback address.
+
+A caller is not bound to a VM. Any client that reaches a transport may name any
+`vm` in a request, so it can attach or detach devices belonging to another VM,
+suspend every VM's devices, or mark a device permanently disconnected. It can
+also make the host rebind PCI devices to `vfio-pci` through `vmm args`.
+Configuration rules bound *which* devices are reachable, not *who* may ask.
+
 ## Development
 
 ```console
 nix develop --command cargo test --all-targets
-nix develop --command cargo clippy --all-targets -- -D warnings
-nix fmt -- --check .
+nix develop --command cargo clippy --all-targets --all-features -- -D warnings
+nix develop --command cargo fmt --all -- --check
+nix develop --command cargo audit
 nix develop --command reuse lint
+nix fmt -- --check flake.nix nix/package.nix
+nix build .#default -L
 ```
+
+`nix build` packages the git tree, so a new file must be at least `git add`ed
+before it will compile there.
