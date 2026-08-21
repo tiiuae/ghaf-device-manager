@@ -72,14 +72,20 @@ pub enum Response {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ResponsePayload {
-    Empty(EmptyResponse),
+    // Order matters: `untagged` tries variants top-down and `Empty` matches any
+    // map, so it must come last or it shadows every populated payload.
     UsbList(UsbListResponse),
     PciList(PciListResponse),
     VmmArgs(VmmArgsResponse),
+    Empty(EmptyResponse),
 }
 
+// Braced and strict, not a unit struct: a unit struct serialises to `null`, which
+// cannot round-trip through the `flatten` + `untagged` pair above, and without
+// `deny_unknown_fields` an empty struct matches every populated payload too.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct EmptyResponse;
+#[serde(deny_unknown_fields)]
+pub struct EmptyResponse {}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UsbListResponse {
@@ -117,7 +123,7 @@ pub struct PciListDevice {
 impl ResponsePayload {
     #[must_use]
     pub(crate) fn empty() -> Self {
-        Self::Empty(EmptyResponse)
+        Self::Empty(EmptyResponse {})
     }
 }
 
@@ -213,5 +219,49 @@ impl From<Result<ResponsePayload>> for Response {
             Ok(payload) => Self::ok(payload),
             Err(error) => Self::failed(error.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_response_payload_round_trips() {
+        // `Empty` is the payload of every attach/detach/block reply, and it is the
+        // one a unit struct silently breaks: `flatten` + `untagged` cannot match null.
+        for payload in [
+            ResponsePayload::empty(),
+            ResponsePayload::UsbList(UsbListResponse {
+                usb_devices: Vec::new(),
+            }),
+            ResponsePayload::PciList(PciListResponse {
+                pci_devices: Vec::new(),
+            }),
+            ResponsePayload::VmmArgs(VmmArgsResponse {
+                vmm_args: vec!["--vfio".into()],
+            }),
+        ] {
+            let expected = std::mem::discriminant(&payload);
+            let wire = serde_json::to_string(&Response::ok(payload)).expect("serialises");
+            let back: Response =
+                serde_json::from_str(&wire).unwrap_or_else(|e| panic!("{wire} did not parse: {e}"));
+            let Response::Ok { payload: got } = back else {
+                panic!("{wire} did not deserialise as Ok");
+            };
+            // Identity matters: an over-permissive variant silently swallows others.
+            assert_eq!(
+                std::mem::discriminant(&got),
+                expected,
+                "wrong variant for {wire}"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_response_round_trips() {
+        let wire = serde_json::to_string(&Response::failed("boom")).expect("serialises");
+        let back: Response = serde_json::from_str(&wire).expect("parses");
+        assert!(matches!(back, Response::Failed { error } if error == "boom"));
     }
 }
