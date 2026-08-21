@@ -461,6 +461,7 @@ async fn reconciliation_reuses_live_binding_and_replaces_it_for_a_new_socket() {
         pci,
     )
     .unwrap();
+    let mut notifications = manager.subscribe();
 
     let (first, queued) = tokio::join!(manager.reconcile(), manager.reconcile());
     first.unwrap();
@@ -474,6 +475,15 @@ async fn reconciliation_reuses_live_binding_and_replaces_it_for_a_new_socket() {
             .count()
     };
     assert_eq!(attach_calls(), 1);
+    let first_notifications =
+        std::iter::from_fn(|| notifications.try_recv().ok()).collect::<Vec<_>>();
+    assert_eq!(
+        first_notifications
+            .iter()
+            .filter(|notification| notification["event"] == "usb_attached")
+            .count(),
+        1
+    );
     let first_state: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&state).unwrap()).unwrap();
     let first_binding = &first_state["crosvm_usb_ports"]["1-2.3"];
@@ -485,6 +495,8 @@ async fn reconciliation_reuses_live_binding_and_replaces_it_for_a_new_socket() {
     manager.reconcile().await.unwrap();
 
     assert_eq!(attach_calls(), 2);
+    assert_eq!(notifications.recv().await.unwrap()["event"], "usb_attached");
+    assert!(notifications.try_recv().is_err());
     assert!(outputs.lock().unwrap().is_empty());
     let second_state: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&state).unwrap()).unwrap();
@@ -494,4 +506,84 @@ async fn reconciliation_reuses_live_binding_and_replaces_it_for_a_new_socket() {
         second_binding["socket_generation"],
         first_binding["socket_generation"]
     );
+}
+
+#[tokio::test]
+async fn reconciliation_does_not_repeat_unchanged_pci_attachment_notification() {
+    let dir = tempfile::tempdir().unwrap();
+    let usb = dir.path().join("sys/usb");
+    let pci = dir.path().join("sys/pci/devices");
+    usb_fixture(&usb);
+    pci_fixture(&pci);
+
+    let mut config = config(
+        &dir.path().join("state.json"),
+        &dir.path().join("vm.sock"),
+        None,
+    );
+    config.usb_passthrough.clear();
+    let outputs = Arc::new(Mutex::new(VecDeque::from([
+        Output {
+            status: 0,
+            stdout: "devices".into(),
+            stderr: String::new(),
+        },
+        Output {
+            status: 0,
+            stdout: "devices".into(),
+            stderr: String::new(),
+        },
+        Output {
+            status: 0,
+            stdout: "ok".into(),
+            stderr: String::new(),
+        },
+        Output {
+            status: 0,
+            stdout: "devices /sys/bus/pci/devices/0000:00:1f.3".into(),
+            stderr: String::new(),
+        },
+        Output {
+            status: 0,
+            stdout: "devices /sys/bus/pci/devices/0000:00:1f.3".into(),
+            stderr: String::new(),
+        },
+    ])));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let manager = DeviceManager::with_roots(
+        config,
+        RecordingCommands {
+            outputs: Arc::clone(&outputs),
+            calls: Arc::clone(&calls),
+        },
+        usb,
+        pci,
+    )
+    .unwrap();
+    let mut notifications = manager.subscribe();
+
+    manager.reconcile().await.unwrap();
+    let first_notifications =
+        std::iter::from_fn(|| notifications.try_recv().ok()).collect::<Vec<_>>();
+    assert_eq!(
+        first_notifications
+            .iter()
+            .filter(|notification| notification["event"] == "pci_attached")
+            .count(),
+        1
+    );
+
+    manager.reconcile().await.unwrap();
+
+    assert!(notifications.try_recv().is_err());
+    assert_eq!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|args| args.windows(2).any(|pair| pair == ["vfio", "add"]))
+            .count(),
+        1
+    );
+    assert!(outputs.lock().unwrap().is_empty());
 }

@@ -303,6 +303,7 @@ impl<R: CommandRunner> DeviceManager<R> {
             .as_deref()
             .context("USB device has no device node")?;
         let current_vm = self.state.lock().await.usb_vms.get(device_node).cloned();
+        let mut attachment_changed = current_vm.as_deref() != Some(vm_name.as_str());
         if current_vm.as_deref().is_some_and(|name| name != vm_name) {
             self.detach_one_usb(device, false).await?;
         }
@@ -329,9 +330,11 @@ impl<R: CommandRunner> DeviceManager<R> {
             }) {
                 binding.port
             } else {
+                attachment_changed = true;
                 self.crosvm.usb_attach(&vm.socket, device_node).await?
             }
         } else {
+            attachment_changed = true;
             self.crosvm.usb_attach(&vm.socket, device_node).await?
         };
         let mut state = self.state.lock().await;
@@ -354,7 +357,9 @@ impl<R: CommandRunner> DeviceManager<R> {
         state.save()?;
         drop(state);
         self.pending_usb_selection.lock().await.remove(&id);
-        self.notify(json!({"event": "usb_attached", "usb_device": device, "vm": vm_name}));
+        if attachment_changed {
+            self.notify(json!({"event": "usb_attached", "usb_device": device, "vm": vm_name}));
+        }
         Ok(())
     }
 
@@ -474,7 +479,8 @@ impl<R: CommandRunner> DeviceManager<R> {
             );
         }
         let vm = self.config.vm(vm_name)?;
-        self.crosvm
+        let live = self
+            .crosvm
             .vfio_list(&vm.socket)
             .await
             .context("VFIO hotplug preflight failed")?;
@@ -495,7 +501,18 @@ impl<R: CommandRunner> DeviceManager<R> {
         } else {
             vec![device.address.clone()]
         };
+        let mut attachment_changed = {
+            let state = self.state.lock().await;
+            attach
+                .iter()
+                .any(|address| state.pci_vms.get(address).map(String::as_str) != Some(vm_name))
+        };
         for address in &attach {
+            let path = format!("/sys/bus/pci/devices/{address}");
+            if live.contains(&path) {
+                continue;
+            }
+            attachment_changed = true;
             self.crosvm.vfio_add(&vm.socket, address).await.with_context(|| {
                 format!("failed to attach {address}; its IOMMU group remains quarantined under vfio-pci")
             })?;
@@ -506,7 +523,9 @@ impl<R: CommandRunner> DeviceManager<R> {
         }
         state.set_disconnected(&device.persistent_id(), false)?;
         drop(state);
-        self.notify(json!({"event": "pci_attached", "pci_device": device, "vm": vm_name}));
+        if attachment_changed {
+            self.notify(json!({"event": "pci_attached", "pci_device": device, "vm": vm_name}));
+        }
         Ok(())
     }
 
