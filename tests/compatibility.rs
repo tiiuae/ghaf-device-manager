@@ -221,6 +221,36 @@ async fn protocol_returns_legacy_failure_shape() {
     );
 }
 
+#[tokio::test]
+async fn reconciliation_defers_instead_of_failing_when_the_vm_is_not_running() {
+    let dir = tempfile::tempdir().unwrap();
+    // `manager()` never creates the control socket, so the VM is not running.
+    let manager = manager(&dir, None);
+    manager.reconcile().await.unwrap();
+    assert!(manager.deferred());
+}
+
+#[tokio::test]
+async fn reconciliation_still_fails_when_the_vm_is_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let usb = dir.path().join("sys/usb");
+    let pci = dir.path().join("sys/pci/devices");
+    let socket = dir.path().join("vm.sock");
+    usb_fixture(&usb);
+    pci_fixture(&pci);
+    // Socket present, so a failing Crosvm call is a real error, not deferrable.
+    write(&socket, "vm generation");
+    let manager = DeviceManager::with_roots(
+        config(&dir.path().join("state.json"), &socket, None),
+        NoCommands,
+        usb,
+        pci,
+    )
+    .unwrap();
+    assert!(manager.reconcile().await.is_err());
+    assert!(!manager.deferred());
+}
+
 #[test]
 fn vmm_args_include_crosvm_hotplug_contract() {
     let dir = tempfile::tempdir().unwrap();

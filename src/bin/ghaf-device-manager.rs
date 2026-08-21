@@ -44,7 +44,7 @@ async fn run() -> Result<()> {
     let manager = Arc::new(DeviceManager::new(config, ProcessRunner)?);
     let initial_reconcile_succeeded = if args.attach_connected {
         match manager.reconcile().await {
-            Ok(()) => true,
+            Ok(()) => !manager.deferred(),
             Err(error) => {
                 warn!(%error, "initial device reconciliation will be retried");
                 false
@@ -73,6 +73,7 @@ async fn run() -> Result<()> {
             }
             while receiver.try_recv().is_ok() {}
             delay = match reconcile.reconcile().await {
+                Ok(()) if reconcile.deferred() => RECONCILE_RETRY_INTERVAL,
                 Ok(()) => RECONCILE_SAFETY_INTERVAL,
                 Err(error) => {
                     warn!(%error, "device reconciliation failed");
