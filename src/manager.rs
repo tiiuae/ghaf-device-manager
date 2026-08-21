@@ -7,13 +7,16 @@ use std::{
     fs,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex, broadcast};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::{
     config::{Config, RuleMatch},
@@ -45,6 +48,7 @@ pub struct DeviceManager<R: CommandRunner> {
     observed_usb: Mutex<HashMap<String, UsbDevice>>,
     observed_pci: Mutex<HashMap<String, PciDevice>>,
     pending_usb_selection: Mutex<HashSet<String>>,
+    deferred: AtomicBool,
 }
 
 impl<R: CommandRunner> DeviceManager<R> {
@@ -78,6 +82,7 @@ impl<R: CommandRunner> DeviceManager<R> {
             observed_usb: Mutex::new(HashMap::new()),
             observed_pci: Mutex::new(HashMap::new()),
             pending_usb_selection: Mutex::new(HashSet::new()),
+            deferred: AtomicBool::new(false),
         })
     }
 
@@ -674,7 +679,12 @@ impl<R: CommandRunner> DeviceManager<R> {
             if in_scope
                 && let Err(error) = self.attach_one_usb(&device, &rule, target.as_deref()).await
             {
-                failures.push(format!("{}: {error}", device.sys_name));
+                if self.vm_stopped(target.as_deref()) {
+                    self.deferred.store(true, Ordering::Relaxed);
+                    debug!(device = %device.sys_name, "deferring USB attach: VM not running");
+                } else {
+                    failures.push(format!("{}: {error}", device.sys_name));
+                }
             }
         }
         aggregate(failures)
@@ -701,13 +711,37 @@ impl<R: CommandRunner> DeviceManager<R> {
                     .attach_one_pci(&device, &rule, rule.target_vm.as_deref())
                     .await
             {
-                failures.push(format!("{}: {error}", device.address));
+                if self.vm_stopped(rule.target_vm.as_deref()) {
+                    self.deferred.store(true, Ordering::Relaxed);
+                    debug!(device = %device.address, "deferring PCI attach: VM not running");
+                } else {
+                    failures.push(format!("{}: {error}", device.address));
+                }
             }
         }
         aggregate(failures)
     }
 
+    /// Whether the last reconcile skipped work because a VM was not running.
+    pub fn deferred(&self) -> bool {
+        self.deferred.load(Ordering::Relaxed)
+    }
+
+    /// A control socket exists only while its VM runs. Every microvm@ service is
+    /// ordered after this manager, so absent sockets are normal during startup.
+    /// Checked only after a failed attach, so real Crosvm errors still surface.
+    fn vm_stopped(&self, vm_name: Option<&str>) -> bool {
+        let Some(name) = vm_name else {
+            return false;
+        };
+        let Ok(vm) = self.config.vm(name) else {
+            return false;
+        };
+        !Path::new(&vm.socket).exists()
+    }
+
     pub async fn reconcile(&self) -> Result<()> {
+        self.deferred.store(false, Ordering::Relaxed);
         self.observe().await?;
         let mut failures = Vec::new();
         if let Err(error) = self.resume_pci(None).await {
