@@ -39,6 +39,7 @@
               clippy
               pkg-config
               reuse
+              rust-analyzer
               rustc
               rustfmt
             ];
