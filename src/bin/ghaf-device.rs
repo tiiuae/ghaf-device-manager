@@ -67,45 +67,24 @@ enum Command {
     },
 }
 
+// Selector families are mutually exclusive; `requires` keeps the two-part ones
+// whole. Flattening `Option<Args>` structs instead would mark every inner field
+// required, which is what broke `--tag`.
 #[derive(Clone, Debug, Args, Default)]
-#[group(required = true, multiple = false)]
+#[group(required = true, multiple = true)]
 struct UsbSelectorArgs {
-    #[command(flatten)]
-    device_node: Option<UsbDeviceNodeArgs>,
-    #[command(flatten)]
-    bus_port: Option<UsbBusPortArgs>,
-    #[command(flatten)]
-    vid_pid: Option<UsbVidPidArgs>,
-    #[command(flatten)]
-    tag: Option<UsbTagArgs>,
-}
-
-#[derive(Clone, Debug, Args)]
-struct UsbDeviceNodeArgs {
-    #[arg(long = "devnode", conflicts_with_all = ["bus", "port", "vid", "pid", "tag"])]
-    device_node: String,
-}
-
-#[derive(Clone, Debug, Args)]
-struct UsbBusPortArgs {
-    #[arg(long, conflicts_with_all = ["devnode", "vid", "pid", "tag"])]
-    bus: u32,
-    #[arg(long, conflicts_with_all = ["devnode", "vid", "pid", "tag"])]
-    port: u32,
-}
-
-#[derive(Clone, Debug, Args)]
-struct UsbVidPidArgs {
-    #[arg(long, conflicts_with_all = ["devnode", "bus", "port", "tag"])]
-    vid: String,
-    #[arg(long, conflicts_with_all = ["devnode", "bus", "port", "tag"])]
-    pid: String,
-}
-
-#[derive(Clone, Debug, Args)]
-struct UsbTagArgs {
-    #[arg(long, conflicts_with_all = ["devnode", "bus", "port", "vid", "pid"])]
-    tag: String,
+    #[arg(id = "devnode", long = "devnode", conflicts_with_all = ["bus", "port", "vid", "pid", "tag"])]
+    device_node: Option<String>,
+    #[arg(id = "bus", long, requires = "port", conflicts_with_all = ["devnode", "vid", "pid", "tag"])]
+    bus: Option<u32>,
+    #[arg(id = "port", long, requires = "bus", conflicts_with_all = ["devnode", "vid", "pid", "tag"])]
+    port: Option<u32>,
+    #[arg(id = "vid", long, requires = "pid", conflicts_with_all = ["devnode", "bus", "port", "tag"])]
+    vid: Option<String>,
+    #[arg(id = "pid", long, requires = "vid", conflicts_with_all = ["devnode", "bus", "port", "tag"])]
+    pid: Option<String>,
+    #[arg(id = "tag", long, conflicts_with_all = ["devnode", "bus", "port", "vid", "pid"])]
+    tag: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -141,34 +120,16 @@ enum UsbAction {
 }
 
 #[derive(Clone, Debug, Args, Default)]
-#[group(required = true, multiple = false)]
+#[group(required = true, multiple = true)]
 struct PciSelectorArgs {
-    #[command(flatten)]
-    address: Option<PciAddressArgs>,
-    #[command(flatten)]
-    vid_did: Option<PciVidDidArgs>,
-    #[command(flatten)]
-    tag: Option<PciTagArgs>,
-}
-
-#[derive(Clone, Debug, Args)]
-struct PciAddressArgs {
-    #[arg(long, conflicts_with_all = ["vid", "did", "tag"])]
-    address: String,
-}
-
-#[derive(Clone, Debug, Args)]
-struct PciVidDidArgs {
-    #[arg(long, conflicts_with_all = ["address", "tag"])]
-    vid: String,
-    #[arg(long, conflicts_with_all = ["address", "tag"])]
-    did: String,
-}
-
-#[derive(Clone, Debug, Args)]
-struct PciTagArgs {
-    #[arg(long, conflicts_with_all = ["address", "vid", "did"])]
-    tag: String,
+    #[arg(id = "address", long, conflicts_with_all = ["vid", "did", "tag"])]
+    address: Option<String>,
+    #[arg(id = "vid", long, requires = "did", conflicts_with_all = ["address", "tag"])]
+    vid: Option<String>,
+    #[arg(id = "did", long, requires = "vid", conflicts_with_all = ["address", "tag"])]
+    did: Option<String>,
+    #[arg(id = "tag", long, conflicts_with_all = ["address", "vid", "did"])]
+    tag: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -338,29 +299,20 @@ impl From<UsbSelectorArgs> for UsbSelector {
     fn from(value: UsbSelectorArgs) -> Self {
         match value {
             UsbSelectorArgs {
-                device_node: Some(UsbDeviceNodeArgs { device_node }),
-                bus_port: None,
-                vid_pid: None,
-                tag: None,
+                device_node: Some(device_node),
+                ..
             } => Self::DeviceNode { device_node },
             UsbSelectorArgs {
-                device_node: None,
-                bus_port: Some(UsbBusPortArgs { bus, port }),
-                vid_pid: None,
-                tag: None,
+                bus: Some(bus),
+                port: Some(port),
+                ..
             } => Self::BusPort { bus, port },
             UsbSelectorArgs {
-                device_node: None,
-                bus_port: None,
-                vid_pid: Some(UsbVidPidArgs { vid, pid }),
-                tag: None,
+                vid: Some(vid),
+                pid: Some(pid),
+                ..
             } => Self::VidPid { vid, pid },
-            UsbSelectorArgs {
-                device_node: None,
-                bus_port: None,
-                vid_pid: None,
-                tag: Some(UsbTagArgs { tag }),
-            } => Self::Tag { tag },
+            UsbSelectorArgs { tag: Some(tag), .. } => Self::Tag { tag },
             _ => unreachable!("clap should enforce exactly one USB selector"),
         }
     }
@@ -370,20 +322,15 @@ impl From<PciSelectorArgs> for PciSelector {
     fn from(value: PciSelectorArgs) -> Self {
         match value {
             PciSelectorArgs {
-                address: Some(PciAddressArgs { address }),
-                vid_did: None,
-                tag: None,
+                address: Some(address),
+                ..
             } => Self::Address { address },
             PciSelectorArgs {
-                address: None,
-                vid_did: Some(PciVidDidArgs { vid, did }),
-                tag: None,
+                vid: Some(vid),
+                did: Some(did),
+                ..
             } => Self::VidDid { vid, did },
-            PciSelectorArgs {
-                address: None,
-                vid_did: None,
-                tag: Some(PciTagArgs { tag }),
-            } => Self::Tag { tag },
+            PciSelectorArgs { tag: Some(tag), .. } => Self::Tag { tag },
             _ => unreachable!("clap should enforce exactly one PCI selector"),
         }
     }
@@ -607,6 +554,84 @@ mod tests {
 
     fn is_dangerous(character: char) -> bool {
         character.is_control() || BIDI.contains(&character)
+    }
+
+    fn pci_selector(args: &[&str]) -> PciSelector {
+        let mut argv = vec!["ghaf-device", "pci", "detach"];
+        argv.extend_from_slice(args);
+        match Cli::try_parse_from(argv)
+            .expect("selector should parse")
+            .command
+        {
+            Command::Pci {
+                action: PciAction::Detach { selector },
+                ..
+            } => selector.into(),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    fn usb_selector(args: &[&str]) -> UsbSelector {
+        let mut argv = vec!["ghaf-device", "usb", "detach"];
+        argv.extend_from_slice(args);
+        match Cli::try_parse_from(argv)
+            .expect("selector should parse")
+            .command
+        {
+            Command::Usb {
+                action: UsbAction::Detach { selector },
+                ..
+            } => selector.into(),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    fn pci_rejects(args: &[&str]) {
+        let mut argv = vec!["ghaf-device", "pci", "detach"];
+        argv.extend_from_slice(args);
+        assert!(Cli::try_parse_from(argv).is_err());
+    }
+
+    #[test]
+    fn each_pci_selector_family_parses_on_its_own() {
+        // `--tag` alone is what ghaf-killswitch passes.
+        assert!(
+            matches!(pci_selector(&["--tag", "audio"]), PciSelector::Tag { tag } if tag == "audio")
+        );
+        assert!(matches!(
+            pci_selector(&["--address", "0000:00:1f.3"]),
+            PciSelector::Address { .. }
+        ));
+        assert!(matches!(
+            pci_selector(&["--vid", "8086", "--did", "51ca"]),
+            PciSelector::VidDid { .. }
+        ));
+    }
+
+    #[test]
+    fn each_usb_selector_family_parses_on_its_own() {
+        assert!(
+            matches!(usb_selector(&["--tag", "cam"]), UsbSelector::Tag { tag } if tag == "cam")
+        );
+        assert!(matches!(
+            usb_selector(&["--devnode", "/dev/bus/usb/003/003"]),
+            UsbSelector::DeviceNode { .. }
+        ));
+        assert!(matches!(
+            usb_selector(&["--bus", "3", "--port", "8"]),
+            UsbSelector::BusPort { bus: 3, port: 8 }
+        ));
+        assert!(matches!(
+            usb_selector(&["--vid", "04f2", "--pid", "b751"]),
+            UsbSelector::VidPid { .. }
+        ));
+    }
+
+    #[test]
+    fn pci_selector_rejects_missing_conflicting_and_partial_input() {
+        pci_rejects(&[]);
+        pci_rejects(&["--tag", "audio", "--address", "0000:00:1f.3"]);
+        pci_rejects(&["--vid", "8086"]);
     }
 
     #[test]
