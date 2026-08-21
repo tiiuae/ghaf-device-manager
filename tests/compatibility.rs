@@ -3,6 +3,7 @@
 
 use std::{
     collections::VecDeque,
+    ffi::OsStr,
     fs,
     os::unix::fs::symlink,
     path::Path,
@@ -13,7 +14,8 @@ use std::{
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use ghaf_device_manager::{
-    CommandRunner, Config, DeviceManager, Selector, api,
+    Action, CommandRunner, Config, DeviceManager, PciSelector, Response, Selector, UsbSelector,
+    api,
     client::{Transport, request},
     crosvm::Output,
 };
@@ -24,7 +26,15 @@ struct NoCommands;
 
 #[async_trait]
 impl CommandRunner for NoCommands {
-    async fn run(&self, _: &str, args: &[String], _: Duration) -> Result<Output> {
+    async fn run<I, A>(&self, _: &Path, args: I, _: Duration) -> Result<Output>
+    where
+        I: IntoIterator<Item = A> + Send,
+        A: AsRef<OsStr> + Send,
+    {
+        let args = args
+            .into_iter()
+            .map(|arg| arg.as_ref().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
         bail!("unexpected command: {args:?}")
     }
 }
@@ -36,7 +46,15 @@ struct ScriptedCommands {
 
 #[async_trait]
 impl CommandRunner for ScriptedCommands {
-    async fn run(&self, _: &str, args: &[String], _: Duration) -> Result<Output> {
+    async fn run<I, A>(&self, _: &Path, args: I, _: Duration) -> Result<Output>
+    where
+        I: IntoIterator<Item = A> + Send,
+        A: AsRef<OsStr> + Send,
+    {
+        let args = args
+            .into_iter()
+            .map(|arg| arg.as_ref().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
         self.outputs
             .lock()
             .unwrap()
@@ -53,8 +71,16 @@ struct RecordingCommands {
 
 #[async_trait]
 impl CommandRunner for RecordingCommands {
-    async fn run(&self, _: &str, args: &[String], _: Duration) -> Result<Output> {
-        self.calls.lock().unwrap().push(args.to_vec());
+    async fn run<I, A>(&self, _: &Path, args: I, _: Duration) -> Result<Output>
+    where
+        I: IntoIterator<Item = A> + Send,
+        A: AsRef<OsStr> + Send,
+    {
+        let args = args
+            .into_iter()
+            .map(|arg| arg.as_ref().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        self.calls.lock().unwrap().push(args.clone());
         self.outputs
             .lock()
             .unwrap()
@@ -166,11 +192,17 @@ fn manager(dir: &tempfile::TempDir, api_socket: Option<&Path>) -> DeviceManager<
 async fn usb_list_preserves_widget_fields() {
     let dir = tempfile::tempdir().unwrap();
     let manager = manager(&dir, None);
-    let response = api::handle(
-        &manager,
-        json!({"action": "usb_list"}).as_object().unwrap().clone(),
+    let response = serde_json::to_value(
+        api::handle(
+            &manager,
+            Action::UsbList {
+                disconnected: None,
+                tag: None,
+            },
+        )
+        .await,
     )
-    .await;
+    .unwrap();
     assert_eq!(response["result"], "ok");
     let device = &response["usb_devices"][0];
     assert_eq!(device["device_node"], "/dev/bus/usb/001/004");
@@ -184,14 +216,17 @@ async fn usb_list_preserves_widget_fields() {
 async fn pci_list_preserves_cli_fields_and_tag_filter() {
     let dir = tempfile::tempdir().unwrap();
     let manager = manager(&dir, None);
-    let response = api::handle(
-        &manager,
-        json!({"action": "pci_list", "tag": "audio"})
-            .as_object()
-            .unwrap()
-            .clone(),
+    let response = serde_json::to_value(
+        api::handle(
+            &manager,
+            Action::PciList {
+                disconnected: None,
+                tag: Some("audio".to_owned()),
+            },
+        )
+        .await,
     )
-    .await;
+    .unwrap();
     let device = &response["pci_devices"][0];
     assert_eq!(device["address"], "0000:00:1f.3");
     assert_eq!(device["vid"], "8086");
@@ -204,21 +239,11 @@ async fn pci_list_preserves_cli_fields_and_tag_filter() {
 async fn protocol_returns_legacy_failure_shape() {
     let dir = tempfile::tempdir().unwrap();
     let manager = manager(&dir, None);
-    let missing = api::handle(&manager, Default::default()).await;
-    assert_eq!(missing["result"], "failed");
-    assert_eq!(missing["error"], "No action specified");
-    let unknown = api::handle(
-        &manager,
-        json!({"action": "no_such_action"})
-            .as_object()
-            .unwrap()
-            .clone(),
-    )
-    .await;
-    assert_eq!(
-        unknown,
-        json!({"result": "failed", "error": "Unknown message: no_such_action"})
-    );
+    assert!(serde_json::from_value::<Action>(json!({})).is_err());
+    assert!(serde_json::from_value::<Action>(json!({"action": "no_such_action"})).is_err());
+    let response =
+        serde_json::to_value(api::handle(&manager, Action::EnableNotifications).await).unwrap();
+    assert_eq!(response, json!({"result": "ok"}));
 }
 
 #[tokio::test]
@@ -313,18 +338,86 @@ async fn unix_wire_protocol_is_newline_delimited_json() {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let response = request(
+    let response: Response = request(
         &Transport::Unix {
             path: socket.to_string_lossy().into_owned(),
         },
-        json!({"action": "usb_list"}),
+        &Action::UsbList {
+            disconnected: None,
+            tag: None,
+        },
         Duration::from_secs(1),
     )
     .await
     .unwrap();
+    let response = serde_json::to_value(response).unwrap();
     assert_eq!(response["result"], "ok");
     assert_eq!(response["usb_devices"][0]["product_name"], "USB Receiver");
     server.abort();
+}
+
+#[test]
+fn protocol_serialization_matches_previous_wire_shape() {
+    assert_eq!(
+        serde_json::to_value(Action::EnableNotifications).unwrap(),
+        json!({"action": "enable_notifications"})
+    );
+    assert_eq!(
+        serde_json::to_value(Action::UsbAttach {
+            selector: UsbSelector::DeviceNode {
+                device_node: "/dev/bus/usb/001/004".to_owned(),
+            },
+            vm: Some("gui-vm".to_owned()),
+        })
+        .unwrap(),
+        json!({
+            "action": "usb_attach",
+            "device_node": "/dev/bus/usb/001/004",
+            "vm": "gui-vm"
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(Action::PciList {
+            disconnected: Some(true),
+            tag: Some("audio".to_owned()),
+        })
+        .unwrap(),
+        json!({
+            "action": "pci_list",
+            "disconnected": true,
+            "tag": "audio"
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(Action::PciAttach {
+            selector: PciSelector::Address {
+                address: "0000:00:1f.3".to_owned(),
+            },
+            vm: None,
+        })
+        .unwrap(),
+        json!({
+            "action": "pci_attach",
+            "address": "0000:00:1f.3",
+            "vm": null
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(Action::VmmArgs {
+            vm: "audio-vm".to_owned(),
+            qemu_bus_prefix: None,
+            qemu_bus_start_index: Some(3),
+            require_pci: true,
+        })
+        .unwrap(),
+        json!({
+            "action": "vmm_args",
+            "vm": "audio-vm",
+            "qemu_bus_prefix": null,
+            "qemu_bus_start_index": 3,
+            "require_pci": true
+        })
+    );
 }
 
 #[test]
@@ -405,7 +498,7 @@ async fn selected_usb_attach_completes_and_updates_legacy_list_fields() {
     .unwrap()
     .unwrap();
     let list = manager.usb_list(Some(false), None).await.unwrap();
-    assert_eq!(list[0]["vm"], "gui-vm");
+    assert_eq!(list[0].vm.as_deref(), Some("gui-vm"));
     assert_eq!(
         fs::read_to_string(dir.path().join("state.json")).unwrap(),
         concat!(

@@ -7,8 +7,11 @@ pub mod config;
 pub mod crosvm;
 pub mod device;
 pub mod manager;
+pub mod protocol;
 pub mod state;
+mod unix_ids;
 
 pub use config::Config;
 pub use crosvm::{CommandRunner, Crosvm, ProcessRunner};
 pub use manager::{DeviceManager, Selector};
+pub use protocol::{Action, PciSelector, Response, ResponsePayload, UsbSelector};

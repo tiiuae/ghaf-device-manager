@@ -3,7 +3,6 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    ffi::CString,
     fs,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
@@ -14,7 +13,8 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use serde_json::{Map, Value, json};
+use nix::unistd::{Gid, Uid, chown};
+use serde_json::{Value, json};
 use tokio::sync::{Mutex, broadcast};
 use tracing::{debug, warn};
 
@@ -22,7 +22,9 @@ use crate::{
     config::{Config, RuleMatch},
     crosvm::{CommandRunner, Crosvm, bind_vfio},
     device::{PciDevice, UsbDevice, iommu_group, scan_pci, scan_usb},
+    protocol::{PciListDevice, UsbListDevice},
     state::{State, UsbPortBinding},
+    unix_ids::{group_id, user_id},
 };
 
 #[derive(Clone, Debug, Default)]
@@ -68,7 +70,7 @@ impl<R: CommandRunner> DeviceManager<R> {
         pci_root: PathBuf,
     ) -> Result<Self> {
         config.validate()?;
-        let state = State::load(config.general.persistency, &config.general.state_path)?;
+        let state = State::load(config.general.persistency, &config.general.state_path);
         let (notifications, _) = broadcast::channel(128);
         let binary = config.general.crosvm.clone();
         Ok(Self {
@@ -126,7 +128,7 @@ impl<R: CommandRunner> DeviceManager<R> {
         &self,
         disconnected: Option<bool>,
         tag: Option<&str>,
-    ) -> Result<Vec<Value>> {
+    ) -> Result<Vec<UsbListDevice>> {
         let state = self.state.lock().await;
         let mut output = Vec::new();
         for (device, rule) in self.usb_devices()? {
@@ -136,29 +138,24 @@ impl<R: CommandRunner> DeviceManager<R> {
             {
                 continue;
             }
-            let mut object = serde_json::to_value(&device)?
-                .as_object()
-                .cloned()
-                .unwrap_or_default();
-            object.insert("allowed_vms".into(), json!(allowed_vms(&rule)));
-            object.insert(
-                "vm".into(),
-                state
-                    .usb_vms
-                    .get(device.device_node.as_deref().unwrap_or_default())
-                    .map_or(Value::Null, |vm| json!(vm)),
-            );
-            object.insert("disconnected".into(), json!(is_disconnected));
-            output.push(Value::Object(object));
+            let device_node = device.device_node.clone();
+            output.push(UsbListDevice {
+                device,
+                allowed_vms: allowed_vms(&rule),
+                vm: device_node
+                    .as_deref()
+                    .and_then(|node| state.usb_vms.get(node).cloned()),
+                disconnected: is_disconnected,
+            });
         }
         Ok(output)
     }
 
-    pub async fn pci_list(
+    pub(crate) async fn pci_list(
         &self,
         disconnected: Option<bool>,
         tag: Option<&str>,
-    ) -> Result<Vec<Value>> {
+    ) -> Result<Vec<PciListDevice>> {
         let state = self.state.lock().await;
         let mut output = Vec::new();
         for (device, rule) in self.pci_devices()? {
@@ -168,20 +165,13 @@ impl<R: CommandRunner> DeviceManager<R> {
             {
                 continue;
             }
-            let mut object = serde_json::to_value(&device)?
-                .as_object()
-                .cloned()
-                .unwrap_or_default();
-            object.insert("allowed_vms".into(), json!(allowed_vms(&rule)));
-            object.insert(
-                "vm".into(),
-                state
-                    .pci_vms
-                    .get(&device.address)
-                    .map_or(Value::Null, |vm| json!(vm)),
-            );
-            object.insert("disconnected".into(), json!(is_disconnected));
-            output.push(Value::Object(object));
+            let address = device.address.clone();
+            output.push(PciListDevice {
+                device,
+                allowed_vms: allowed_vms(&rule),
+                vm: state.pci_vms.get(&address).cloned(),
+                disconnected: is_disconnected,
+            });
         }
         Ok(output)
     }
@@ -268,7 +258,7 @@ impl<R: CommandRunner> DeviceManager<R> {
                 failures.push(format!("{}: {error}", device.sys_name));
             }
         }
-        aggregate(failures)
+        aggregate(&failures)
     }
 
     async fn attach_one_usb(
@@ -368,7 +358,7 @@ impl<R: CommandRunner> DeviceManager<R> {
         Ok(())
     }
 
-    pub async fn detach_usb(&self, selector: &Selector, permanent: bool) -> Result<()> {
+    pub(crate) async fn detach_usb(&self, selector: &Selector, permanent: bool) -> Result<()> {
         let _operation = self.operation.lock().await;
         let devices = self.selected_usb(selector)?;
         let mut failures = Vec::new();
@@ -377,7 +367,7 @@ impl<R: CommandRunner> DeviceManager<R> {
                 failures.push(format!("{}: {error}", device.sys_name));
             }
         }
-        aggregate(failures)
+        aggregate(&failures)
     }
 
     async fn detach_one_usb(&self, device: &UsbDevice, permanent: bool) -> Result<()> {
@@ -404,10 +394,10 @@ impl<R: CommandRunner> DeviceManager<R> {
         };
         if let Some(vm_name) = vm_name {
             let vm = self.config.vm(&vm_name)?;
-            if !Path::new(&vm.socket).exists() {
+            if !vm.socket.exists() {
                 warn!(
                     vm = %vm_name,
-                    socket = %vm.socket,
+                    socket = %vm.socket.display(),
                     "VM socket is absent; clearing stale USB attachment state"
                 );
             } else if let Some(binding) = binding.filter(|binding| {
@@ -454,7 +444,11 @@ impl<R: CommandRunner> DeviceManager<R> {
         Ok(())
     }
 
-    pub async fn attach_pci(&self, selector: &Selector, requested_vm: Option<&str>) -> Result<()> {
+    pub(crate) async fn attach_pci(
+        &self,
+        selector: &Selector,
+        requested_vm: Option<&str>,
+    ) -> Result<()> {
         let _operation = self.operation.lock().await;
         let devices = self.selected_pci(selector)?;
         let mut failures = Vec::new();
@@ -463,7 +457,7 @@ impl<R: CommandRunner> DeviceManager<R> {
                 failures.push(format!("{}: {error}", device.address));
             }
         }
-        aggregate(failures)
+        aggregate(&failures)
     }
 
     async fn attach_one_pci(
@@ -534,7 +528,7 @@ impl<R: CommandRunner> DeviceManager<R> {
         Ok(())
     }
 
-    pub async fn detach_pci(&self, selector: &Selector, permanent: bool) -> Result<()> {
+    pub(crate) async fn detach_pci(&self, selector: &Selector, permanent: bool) -> Result<()> {
         let _operation = self.operation.lock().await;
         let devices = self.selected_pci(selector)?;
         let mut failures = Vec::new();
@@ -543,7 +537,7 @@ impl<R: CommandRunner> DeviceManager<R> {
                 failures.push(format!("{}: {error}", device.address));
             }
         }
-        aggregate(failures)
+        aggregate(&failures)
     }
 
     async fn detach_one_pci(
@@ -568,14 +562,14 @@ impl<R: CommandRunner> DeviceManager<R> {
             } else {
                 vec![device.address.clone()]
             };
-            if Path::new(&vm.socket).exists() {
+            if vm.socket.exists() {
                 for address in &detach {
                     self.crosvm.vfio_remove(&vm.socket, address).await?;
                 }
             } else {
                 warn!(
                     vm = %vm_name,
-                    socket = %vm.socket,
+                    socket = %vm.socket.display(),
                     "VM socket is absent; clearing stale PCI attachment state"
                 );
             }
@@ -593,7 +587,7 @@ impl<R: CommandRunner> DeviceManager<R> {
         Ok(())
     }
 
-    pub async fn suspend_usb(&self, vm: Option<&str>) -> Result<()> {
+    pub(crate) async fn suspend_usb(&self, vm: Option<&str>) -> Result<()> {
         let _operation = self.operation.lock().await;
         let devices = self
             .usb_devices()?
@@ -617,10 +611,10 @@ impl<R: CommandRunner> DeviceManager<R> {
                 failures.push(format!("{}: {error}", device.sys_name));
             }
         }
-        aggregate(failures)
+        aggregate(&failures)
     }
 
-    pub async fn suspend_pci(&self, vm: Option<&str>) -> Result<()> {
+    pub(crate) async fn suspend_pci(&self, vm: Option<&str>) -> Result<()> {
         let _operation = self.operation.lock().await;
         let devices = self
             .pci_devices()?
@@ -644,7 +638,7 @@ impl<R: CommandRunner> DeviceManager<R> {
                 failures.push(format!("{}: {error}", device.address));
             }
         }
-        aggregate(failures)
+        aggregate(&failures)
     }
 
     pub async fn resume_usb(&self, vm: Option<&str>) -> Result<()> {
@@ -687,10 +681,10 @@ impl<R: CommandRunner> DeviceManager<R> {
                 }
             }
         }
-        aggregate(failures)
+        aggregate(&failures)
     }
 
-    pub async fn resume_pci(&self, vm: Option<&str>) -> Result<()> {
+    pub(crate) async fn resume_pci(&self, vm: Option<&str>) -> Result<()> {
         let _operation = self.operation.lock().await;
         let devices = self.pci_devices()?;
         let mut failures = Vec::new();
@@ -719,7 +713,7 @@ impl<R: CommandRunner> DeviceManager<R> {
                 }
             }
         }
-        aggregate(failures)
+        aggregate(&failures)
     }
 
     /// Whether the last reconcile skipped work because a VM was not running.
@@ -750,7 +744,7 @@ impl<R: CommandRunner> DeviceManager<R> {
         if let Err(error) = self.resume_usb(None).await {
             failures.push(format!("USB: {error}"));
         }
-        aggregate(failures)
+        aggregate(&failures)
     }
 
     async fn observe(&self) -> Result<()> {
@@ -903,7 +897,7 @@ fn allowed_vms(rule: &RuleMatch) -> Vec<String> {
         .collect()
 }
 
-fn aggregate(failures: Vec<String>) -> Result<()> {
+fn aggregate<T: std::borrow::Borrow<str>>(failures: &[T]) -> Result<()> {
     if failures.is_empty() {
         Ok(())
     } else {
@@ -911,7 +905,7 @@ fn aggregate(failures: Vec<String>) -> Result<()> {
     }
 }
 
-fn socket_generation(path: &str) -> Option<String> {
+fn socket_generation(path: &Path) -> Option<String> {
     let metadata = fs::metadata(path).ok()?;
     Some(format!(
         "{}:{}:{}",
@@ -1020,63 +1014,14 @@ fn chown_named(path: &str, user: Option<&str>, group: Option<&str>) -> Result<()
     if user.is_none() && group.is_none() {
         return Ok(());
     }
-    let uid = match user {
-        Some(name) => {
-            let name = CString::new(name)?;
-            // SAFETY: getpwnam returns a process-owned record and the scalar is copied immediately.
-            let record = unsafe { libc::getpwnam(name.as_ptr()) };
-            if record.is_null() {
-                bail!("unknown ACPI table user {}", name.to_string_lossy());
-            }
-            // SAFETY: the pointer was checked for null.
-            unsafe { (*record).pw_uid }
-        }
-        None => u32::MAX,
-    };
-    let gid = match group {
-        Some(name) => {
-            let name = CString::new(name)?;
-            // SAFETY: getgrnam returns a process-owned record and the scalar is copied immediately.
-            let record = unsafe { libc::getgrnam(name.as_ptr()) };
-            if record.is_null() {
-                bail!("unknown ACPI table group {}", name.to_string_lossy());
-            }
-            // SAFETY: the pointer was checked for null.
-            unsafe { (*record).gr_gid }
-        }
-        None => u32::MAX,
-    };
-    let path = CString::new(path)?;
-    // SAFETY: path is a valid NUL-terminated string; uid/gid use -1 to preserve an owner.
-    if unsafe { libc::chown(path.as_ptr(), uid, gid) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
+    let uid = user
+        .map(|name| user_id(name).with_context(|| format!("unknown ACPI table user {name}")))
+        .transpose()?
+        .map(Uid::from_raw);
+    let gid = group
+        .map(|name| group_id(name).with_context(|| format!("unknown ACPI table group {name}")))
+        .transpose()?
+        .map(Gid::from_raw);
+    chown(path, uid, gid)?;
     Ok(())
-}
-
-pub fn request_selector(message: &Map<String, Value>) -> Selector {
-    Selector {
-        device_node: text(message, "device_node"),
-        bus: number(message, "bus"),
-        port: number(message, "port"),
-        vid: text(message, "vid"),
-        pid: text(message, "pid"),
-        address: text(message, "address"),
-        did: text(message, "did"),
-        tag: text(message, "tag"),
-    }
-}
-
-fn text(message: &Map<String, Value>, key: &str) -> Option<String> {
-    message
-        .get(key)
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-}
-
-fn number(message: &Map<String, Value>, key: &str) -> Option<u32> {
-    message
-        .get(key)
-        .and_then(Value::as_u64)
-        .and_then(|v| u32::try_from(v).ok())
 }

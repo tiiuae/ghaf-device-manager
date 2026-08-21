@@ -2,66 +2,37 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result, bail};
 use regex::RegexBuilder;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::device::{PciDevice, UsbDevice};
 
-fn default_true() -> bool {
-    true
-}
+const DEFAULT_STATE_PATH: &str = "/var/lib/vhotplug/vhotplug.state";
+const DEFAULT_CROSVM: &str = "crosvm";
+const DEFAULT_MODPROBE: &str = "modprobe";
+const DEFAULT_MODINFO: &str = "modinfo";
+const DEFAULT_TCP_PORT: u16 = 2000;
+const DEFAULT_VSOCK_PORT: u32 = 2000;
+const DEFAULT_API_HOST: &str = "127.0.0.1";
+const DEFAULT_UNIX_SOCKET: &str = "/var/lib/vhotplug/vhotplug.sock";
 
-fn default_state_path() -> String {
-    "/var/lib/vhotplug/vhotplug.state".into()
-}
-
-fn default_crosvm() -> String {
-    "crosvm".into()
-}
-
-fn default_modprobe() -> String {
-    "modprobe".into()
-}
-
-fn default_modinfo() -> String {
-    "modinfo".into()
-}
-
-fn default_api_port() -> u32 {
-    2000
-}
-
-fn default_api_host() -> String {
-    "127.0.0.1".into()
-}
-
-fn default_unix_socket() -> String {
-    "/var/lib/vhotplug/vhotplug.sock".into()
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct Config {
-    #[serde(default)]
     pub usb_passthrough: Vec<Value>,
-    #[serde(default)]
     pub pci_passthrough: Vec<Value>,
-    #[serde(default)]
     pub evdev_passthrough: Vec<Value>,
-    #[serde(default)]
     pub acpi_passthrough: Vec<Value>,
-    #[serde(default)]
     pub vms: Vec<Vm>,
-    #[serde(default)]
     pub general: General,
     #[serde(skip)]
     driver_cache: Arc<Mutex<HashMap<String, Vec<String>>>>,
@@ -72,24 +43,28 @@ pub struct Config {
 pub struct Vm {
     pub name: String,
     #[serde(rename = "type")]
-    pub vm_type: String,
-    pub socket: String,
+    pub vm_type: VmType,
+    pub socket: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VmType {
+    Crosvm,
+    #[allow(dead_code)]
+    Qemu,
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub struct General {
-    #[serde(default = "default_true")]
     pub persistency: bool,
-    #[serde(default = "default_state_path")]
-    pub state_path: String,
-    #[serde(default = "default_crosvm")]
-    pub crosvm: String,
-    #[serde(default = "default_modprobe")]
-    pub modprobe: String,
-    #[serde(default = "default_modinfo")]
-    pub modinfo: String,
-    #[serde(default)]
+    pub state_path: PathBuf,
+    pub crosvm: PathBuf,
+    pub modprobe: PathBuf,
+    pub modinfo: PathBuf,
     pub api: Api,
 }
 
@@ -97,30 +72,34 @@ impl Default for General {
     fn default() -> Self {
         Self {
             persistency: true,
-            state_path: default_state_path(),
-            crosvm: default_crosvm(),
-            modprobe: default_modprobe(),
-            modinfo: default_modinfo(),
+            state_path: DEFAULT_STATE_PATH.into(),
+            crosvm: DEFAULT_CROSVM.into(),
+            modprobe: DEFAULT_MODPROBE.into(),
+            modinfo: DEFAULT_MODINFO.into(),
             api: Api::default(),
         }
     }
 }
 
 #[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "lowercase")]
+pub enum ApiTransport {
+    Unix,
+    Tcp,
+    Vsock,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct Api {
-    #[serde(default = "default_true")]
     pub enable: bool,
-    #[serde(default)]
-    pub transports: Vec<String>,
-    #[serde(default = "default_api_host")]
+    pub transports: Vec<ApiTransport>,
     pub host: String,
-    #[serde(default = "default_api_port")]
-    pub port: u32,
-    #[serde(default)]
-    pub allowed_cids: Vec<u32>,
-    #[serde(default = "default_unix_socket")]
-    pub unix_socket: String,
+    pub tcp_port: u16,
+    pub vsock_port: u32,
+    pub port: Option<u32>,
+    pub allowed_cids: HashSet<u32>,
+    pub unix_socket: PathBuf,
     pub unix_socket_user: Option<String>,
     pub unix_socket_group: Option<String>,
     pub unix_socket_mode: Option<String>,
@@ -131,10 +110,12 @@ impl Default for Api {
         Self {
             enable: true,
             transports: Vec::new(),
-            host: default_api_host(),
-            port: default_api_port(),
-            allowed_cids: Vec::new(),
-            unix_socket: default_unix_socket(),
+            host: DEFAULT_API_HOST.to_owned(),
+            tcp_port: DEFAULT_TCP_PORT,
+            vsock_port: DEFAULT_VSOCK_PORT,
+            port: None,
+            allowed_cids: HashSet::new(),
+            unix_socket: DEFAULT_UNIX_SOCKET.into(),
             unix_socket_user: None,
             unix_socket_group: None,
             unix_socket_mode: None,
@@ -314,7 +295,7 @@ impl Config {
         let has_valid_interface = device
             .interfaces
             .iter()
-            .any(|interface| !matches!(interface.class, None | Some(0) | Some(0xff)));
+            .any(|interface| !matches!(interface.class, None | Some(0 | 0xff)));
         let Some(pattern) = (!has_valid_interface)
             .then(|| selector.get("driverPath").and_then(Value::as_str))
             .flatten()
@@ -387,39 +368,30 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.vms.iter().any(|vm| vm.vm_type != "crosvm") {
+        if self.vms.iter().any(|vm| vm.vm_type != VmType::Crosvm) {
             bail!("ghaf-device-manager supports only Crosvm VMs");
         }
         let mut names = HashMap::new();
         for vm in &self.vms {
-            if vm.name.is_empty() || vm.socket.is_empty() {
+            if vm.name.is_empty() || vm.socket.as_os_str().is_empty() {
                 bail!("VM name and socket must not be empty");
             }
             if names.insert(&vm.name, &vm.socket).is_some() {
                 bail!("duplicate VM name {}", vm.name);
             }
         }
-        for transport in &self.general.api.transports {
-            if !matches!(transport.as_str(), "unix" | "tcp" | "vsock") {
-                bail!("unsupported API transport {transport}");
-            }
-        }
-        if self.general.api.transports.iter().any(|item| item == "tcp")
-            && self.general.api.port > u16::MAX.into()
-        {
-            bail!("TCP API port must be at most {}", u16::MAX);
-        }
         Ok(())
     }
 
-    pub fn vm(&self, name: &str) -> Result<&Vm> {
+    pub(crate) fn vm(&self, name: &str) -> Result<&Vm> {
         self.vms
             .iter()
             .find(|vm| vm.name == name)
             .with_context(|| format!("VM {name} is not found in the configuration"))
     }
 
-    pub fn usb_rule(&self, device: &UsbDevice) -> Option<RuleMatch> {
+    #[must_use]
+    pub(crate) fn usb_rule(&self, device: &UsbDevice) -> Option<RuleMatch> {
         self.usb_passthrough.iter().find_map(|rule| {
             let target_vm = string(rule, "targetVm");
             let allowed_vms = string_list(rule, "allowedVms");
@@ -439,7 +411,7 @@ impl Config {
         })
     }
 
-    pub fn pci_rule(&self, device: &PciDevice) -> Option<RuleMatch> {
+    pub(crate) fn pci_rule(&self, device: &PciDevice) -> Option<RuleMatch> {
         let mut order = 0;
         for rule in &self.pci_passthrough {
             if !enabled(rule) {
@@ -484,7 +456,8 @@ impl Config {
         None
     }
 
-    pub fn has_pci_rules(&self, vm: &str) -> bool {
+    #[must_use]
+    pub(crate) fn has_pci_rules(&self, vm: &str) -> bool {
         self.pci_passthrough
             .iter()
             .any(|rule| enabled(rule) && rule.get("targetVm").and_then(Value::as_str) == Some(vm))

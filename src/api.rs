@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
-    ffi::CString,
     fs,
     os::unix::fs::{PermissionsExt, chown},
     path::Path,
@@ -11,7 +10,6 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{Map, Value, json};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, UnixListener},
@@ -22,8 +20,13 @@ use tokio_vsock::{VMADDR_CID_ANY, VsockAddr, VsockListener};
 use tracing::{info, warn};
 
 use crate::{
+    config::ApiTransport,
     crosvm::CommandRunner,
-    manager::{DeviceManager, request_selector},
+    manager::DeviceManager,
+    protocol::{
+        Action, PciListResponse, Response, ResponsePayload, UsbListResponse, VmmArgsResponse,
+    },
+    unix_ids::{group_id, user_id},
 };
 
 const MAX_MESSAGE: usize = 1024 * 1024;
@@ -39,59 +42,54 @@ pub async fn serve<R: CommandRunner + 'static>(manager: Arc<DeviceManager<R>>) -
         return Ok(());
     }
     let transports = api.transports.clone();
-    let mut tasks = JoinSet::new();
+    let mut tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();
     for transport in transports {
-        match transport.as_str() {
-            "unix" => {
-                let path = api.unix_socket.clone();
-                if let Some(parent) = Path::new(&path).parent() {
+        let manager = manager.clone();
+        match transport {
+            ApiTransport::Unix => {
+                let path = &api.unix_socket;
+                if let Some(parent) = path.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                if Path::new(&path).exists() {
-                    fs::remove_file(&path)?;
+                if path.exists() {
+                    fs::remove_file(path)?;
                 }
-                let listener = UnixListener::bind(&path)
-                    .with_context(|| format!("failed to bind Unix socket {path}"))?;
+                let listener = UnixListener::bind(path)
+                    .with_context(|| format!("failed to bind Unix socket {}", path.display()))?;
                 configure_unix_socket(
-                    &path,
+                    path,
                     api.unix_socket_user.as_deref(),
                     api.unix_socket_group.as_deref(),
                     api.unix_socket_mode.as_deref(),
                 )?;
-                info!(%path, "API listening on Unix socket");
-                let manager = Arc::clone(&manager);
+                info!(path = %path.display(), "API listening on Unix socket");
                 tasks.spawn(async move {
                     loop {
                         let (stream, _) = listener.accept().await?;
                         tokio::spawn(connection(Arc::clone(&manager), stream));
                     }
-                    #[allow(unreachable_code)]
-                    Ok::<_, anyhow::Error>(())
                 });
             }
-            "tcp" => {
-                let address = format!("{}:{}", api.host, api.port);
+            ApiTransport::Tcp => {
+                let port = api.port.map_or(Ok(api.tcp_port), TryFrom::try_from)?;
+                let address = format!("{}:{}", api.host, port);
                 let listener = TcpListener::bind(&address)
                     .await
-                    .with_context(|| format!("failed to bind TCP address {address}"))?;
+                    .with_context(|| format!("failed to bind TCP address {}:{}", api.host, port))?;
                 info!(%address, "API listening on TCP");
-                let manager = Arc::clone(&manager);
                 tasks.spawn(async move {
                     loop {
                         let (stream, _) = listener.accept().await?;
                         tokio::spawn(connection(Arc::clone(&manager), stream));
                     }
-                    #[allow(unreachable_code)]
-                    Ok::<_, anyhow::Error>(())
                 });
             }
-            "vsock" => {
-                let port = api.port;
+            ApiTransport::Vsock => {
+                let port = api.vsock_port;
                 let allowed = api.allowed_cids.clone();
                 let listener = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, port))
                     .with_context(|| format!("failed to bind VSOCK port {port}"))?;
                 info!(port, "API listening on VSOCK");
-                let manager = Arc::clone(&manager);
                 tasks.spawn(async move {
                     loop {
                         let (stream, address) = listener.accept().await?;
@@ -101,11 +99,8 @@ pub async fn serve<R: CommandRunner + 'static>(manager: Arc<DeviceManager<R>>) -
                         }
                         tokio::spawn(connection(Arc::clone(&manager), stream));
                     }
-                    #[allow(unreachable_code)]
-                    Ok::<_, anyhow::Error>(())
                 });
             }
-            other => bail!("unsupported API transport {other}"),
         }
     }
     match tasks.join_next().await {
@@ -138,7 +133,7 @@ where
                                 break;
                             }
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => (),
                         Err(_) => break,
                     }
                 }
@@ -166,109 +161,91 @@ where
         return false;
     };
     let response = match line {
-        Ok(line) => match serde_json::from_str::<Value>(&line) {
-            Ok(Value::Object(message)) => {
-                if message.get("action").and_then(Value::as_str) == Some("enable_notifications") {
+        Ok(line) => match serde_json::from_str::<Action>(&line) {
+            Ok(message) => {
+                if matches!(&message, Action::EnableNotifications) {
                     *notifications = true;
                 }
                 handle(manager, message).await
             }
-            Ok(_) => json!({"result": "failed", "error": "API message must be a JSON object"}),
-            Err(error) => json!({"result": "failed", "error": format!("Invalid JSON: {error}")}),
+            Err(error) => Response::failed(format!("Invalid API message: {error}")),
         },
-        Err(error) => json!({"result": "failed", "error": format!("Invalid API message: {error}")}),
+        Err(error) => Response::failed(format!("Invalid API message: {error}")),
     };
-    framed.send(response.to_string()).await.is_ok()
+    framed
+        .send(serde_json::to_string(&response).unwrap())
+        .await
+        .is_ok()
 }
 
-pub async fn handle<R: CommandRunner>(
-    manager: &DeviceManager<R>,
-    message: Map<String, Value>,
-) -> Value {
-    match handle_inner(manager, &message).await {
-        Ok(value) => value,
-        Err(error) => json!({"result": "failed", "error": error.to_string()}),
-    }
+pub async fn handle<R: CommandRunner>(manager: &DeviceManager<R>, message: Action) -> Response {
+    handle_inner(manager, message).await.into()
 }
 
 async fn handle_inner<R: CommandRunner>(
     manager: &DeviceManager<R>,
-    message: &Map<String, Value>,
-) -> Result<Value> {
-    let action = message
-        .get("action")
-        .and_then(Value::as_str)
-        .context("No action specified")?;
-    let selector = request_selector(message);
-    let vm = message.get("vm").and_then(Value::as_str);
-    let disconnected = message.get("disconnected").and_then(Value::as_bool);
-    let tag = message.get("tag").and_then(Value::as_str);
-    match action {
-        "enable_notifications" => Ok(json!({"result": "ok"})),
-        "usb_list" => {
-            Ok(json!({"result": "ok", "usb_devices": manager.usb_list(disconnected, tag).await?}))
+    message: Action,
+) -> Result<ResponsePayload> {
+    match message {
+        Action::EnableNotifications => Ok(ResponsePayload::empty()),
+        Action::UsbList { disconnected, tag } => Ok(ResponsePayload::UsbList(UsbListResponse {
+            usb_devices: manager.usb_list(disconnected, tag.as_deref()).await?,
+        })),
+        Action::UsbAttach { selector, vm } => {
+            let selector: crate::manager::Selector = selector.into();
+            manager.attach_usb(&selector, vm.as_deref()).await?;
+            Ok(ResponsePayload::empty())
         }
-        "usb_attach" => {
-            manager.attach_usb(&selector, vm).await?;
-            Ok(json!({"result": "ok"}))
-        }
-        "usb_detach" => {
+        Action::UsbDetach { selector } => {
+            let selector: crate::manager::Selector = selector.into();
             manager.detach_usb(&selector, true).await?;
-            Ok(json!({"result": "ok"}))
+            Ok(ResponsePayload::empty())
         }
-        "usb_suspend" => {
-            manager.suspend_usb(vm).await?;
-            Ok(json!({"result": "ok"}))
+        Action::UsbSuspend { vm } => {
+            manager.suspend_usb(vm.as_deref()).await?;
+            Ok(ResponsePayload::empty())
         }
-        "usb_resume" => {
-            manager.resume_usb(vm).await?;
-            Ok(json!({"result": "ok"}))
+        Action::UsbResume { vm } => {
+            manager.resume_usb(vm.as_deref()).await?;
+            Ok(ResponsePayload::empty())
         }
-        "pci_list" => {
-            Ok(json!({"result": "ok", "pci_devices": manager.pci_list(disconnected, tag).await?}))
+        Action::PciList { disconnected, tag } => Ok(ResponsePayload::PciList(PciListResponse {
+            pci_devices: manager.pci_list(disconnected, tag.as_deref()).await?,
+        })),
+        Action::PciAttach { selector, vm } => {
+            let selector: crate::manager::Selector = selector.into();
+            manager.attach_pci(&selector, vm.as_deref()).await?;
+            Ok(ResponsePayload::empty())
         }
-        "pci_attach" => {
-            manager.attach_pci(&selector, vm).await?;
-            Ok(json!({"result": "ok"}))
-        }
-        "pci_detach" => {
+        Action::PciDetach { selector } => {
+            let selector: crate::manager::Selector = selector.into();
             manager.detach_pci(&selector, true).await?;
-            Ok(json!({"result": "ok"}))
+            Ok(ResponsePayload::empty())
         }
-        "pci_suspend" => {
-            manager.suspend_pci(vm).await?;
-            Ok(json!({"result": "ok"}))
+        Action::PciSuspend { vm } => {
+            manager.suspend_pci(vm.as_deref()).await?;
+            Ok(ResponsePayload::empty())
         }
-        "pci_resume" => {
-            manager.resume_pci(vm).await?;
-            Ok(json!({"result": "ok"}))
+        Action::PciResume { vm } => {
+            manager.resume_pci(vm.as_deref()).await?;
+            Ok(ResponsePayload::empty())
         }
-        "vmm_args" => {
-            let vm = vm.context("VM name is required")?;
-            let require_pci = message
-                .get("require_pci")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            Ok(json!({"result": "ok", "vmm_args": manager.vmm_args(vm, require_pci)?}))
-        }
-        _ => Ok(json!({"result": "failed", "error": format!("Unknown message: {action}")})),
+        Action::VmmArgs {
+            vm, require_pci, ..
+        } => Ok(ResponsePayload::VmmArgs(VmmArgsResponse {
+            vmm_args: manager.vmm_args(&vm, require_pci)?,
+        })),
     }
 }
 
 fn configure_unix_socket(
-    path: &str,
+    path: &Path,
     user: Option<&str>,
     group: Option<&str>,
     mode: Option<&str>,
 ) -> Result<()> {
-    let uid = match user {
-        Some(user) => Some(user_id(user)?),
-        None => None,
-    };
-    let gid = match group {
-        Some(group) => Some(group_id(group)?),
-        None => None,
-    };
+    let uid = user.map(user_id).transpose()?;
+    let gid = group.map(group_id).transpose()?;
     if uid.is_some() || gid.is_some() {
         chown(path, uid, gid)?;
     }
@@ -277,26 +254,4 @@ fn configure_unix_socket(
         fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
     }
     Ok(())
-}
-
-fn user_id(name: &str) -> Result<u32> {
-    let name = CString::new(name)?;
-    // SAFETY: getpwnam returns a process-owned record valid until the next libc lookup.
-    let record = unsafe { libc::getpwnam(name.as_ptr()) };
-    if record.is_null() {
-        bail!("unknown user {}", name.to_string_lossy());
-    }
-    // SAFETY: null was checked and we copy the scalar field immediately.
-    Ok(unsafe { (*record).pw_uid })
-}
-
-fn group_id(name: &str) -> Result<u32> {
-    let name = CString::new(name)?;
-    // SAFETY: getgrnam returns a process-owned record valid until the next libc lookup.
-    let record = unsafe { libc::getgrnam(name.as_ptr()) };
-    if record.is_null() {
-        bail!("unknown group {}", name.to_string_lossy());
-    }
-    // SAFETY: null was checked and we copy the scalar field immediately.
-    Ok(unsafe { (*record).gr_gid })
 }

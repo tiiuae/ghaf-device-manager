@@ -1,12 +1,14 @@
 // SPDX-FileCopyrightText: 2026 TII (SSRC) and the Ghaf contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{os::fd::AsRawFd, sync::Arc, thread, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use clap::Parser;
 use ghaf_device_manager::{Config, DeviceManager, ProcessRunner, api};
+use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
+use tokio::task::LocalSet;
 use tracing::{error, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -17,7 +19,7 @@ const RECONCILE_SAFETY_INTERVAL: Duration = Duration::from_secs(30);
 #[command(about = "Crosvm device manager for Ghaf")]
 struct Args {
     #[arg(short, long)]
-    config: String,
+    config: PathBuf,
     #[arg(short = 'a', long = "attach-connected")]
     attach_connected: bool,
     #[arg(short, long)]
@@ -26,7 +28,9 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
-    if let Err(error) = run().await {
+    let local = LocalSet::new();
+    let result = local.run_until(run()).await;
+    if let Err(error) = result {
         error!(error = %format!("{error:#}"), "ghaf-device-manager failed");
         eprintln!("ERROR {error:#}");
         std::process::exit(1);
@@ -69,7 +73,7 @@ async fn run() -> Result<()> {
                         break;
                     }
                 }
-                _ = tokio::time::sleep(delay) => {}
+                () = tokio::time::sleep(delay) => {}
             }
             while receiver.try_recv().is_ok() {}
             delay = match reconcile.reconcile().await {
@@ -91,36 +95,28 @@ async fn run() -> Result<()> {
 }
 
 fn spawn_udev_monitor(sender: mpsc::Sender<()>) -> Result<()> {
-    thread::Builder::new()
-        .name("udev-monitor".into())
-        .spawn(move || {
-            let socket = match udev::MonitorBuilder::new().and_then(udev::MonitorBuilder::listen) {
-                Ok(socket) => socket,
+    let socket = udev::MonitorBuilder::new()?.listen()?;
+    let mut socket = AsyncFd::new(socket)?;
+    tokio::task::spawn_local(async move {
+        loop {
+            let mut guard = match socket.readable_mut().await {
+                Ok(guard) => guard,
                 Err(error) => {
                     eprintln!("ERROR failed to start udev monitor: {error}");
-                    return;
-                }
-            };
-            let mut descriptor = libc::pollfd {
-                fd: socket.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            loop {
-                // SAFETY: descriptor points to one initialized pollfd for the duration of the call.
-                if unsafe { libc::poll(&mut descriptor, 1, -1) } <= 0 {
-                    continue;
-                }
-                let relevant = socket.iter().any(|event| {
-                    matches!(
-                        event.subsystem().and_then(|value| value.to_str()),
-                        Some("usb" | "pci")
-                    )
-                });
-                if relevant && sender.blocking_send(()).is_err() {
                     break;
                 }
+            };
+            let relevant = guard.get_inner_mut().iter().any(|event| {
+                matches!(
+                    event.subsystem().and_then(|value| value.to_str()),
+                    Some("usb" | "pci")
+                )
+            });
+            guard.clear_ready();
+            if relevant && sender.send(()).await.is_err() {
+                break;
             }
-        })?;
+        }
+    });
     Ok(())
 }
