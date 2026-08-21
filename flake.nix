@@ -35,6 +35,7 @@
           default = pkgs.mkShell {
             packages = with pkgs; [
               cargo
+              cargo-audit
               clippy
               pkg-config
               reuse
@@ -46,6 +47,6 @@
         }
       );
 
-      formatter = forAllSystems (system: nixpkgs.legacyPackages.${system}.nixfmt-rfc-style);
+      formatter = forAllSystems (system: nixpkgs.legacyPackages.${system}.nixfmt);
     };
 }

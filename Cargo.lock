@@ -277,8 +277,7 @@ dependencies = [
  "async-trait",
  "clap",
  "futures-util",
- "libc",
- "nix 0.30.1",
+ "nix",
  "regex",
  "serde",
  "serde_json",
@@ -403,18 +402,6 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "nix"
-version = "0.30.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
-dependencies = [
- "bitflags",
- "cfg-if",
- "cfg_aliases",
- "libc",
 ]
 
 [[package]]
@@ -854,7 +841,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ba782755fc073877e567c2253c0be48e4aa9a254c232d36d3985dfae0bd5205"
 dependencies = [
  "libc",
- "nix 0.31.3",
+ "nix",
 ]
 
 [[package]]

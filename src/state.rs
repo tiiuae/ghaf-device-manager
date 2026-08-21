@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 TII (SSRC) and the Ghaf contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::HashMap, fs, io::Write, os::unix::fs::PermissionsExt, path::PathBuf};
+use std::{collections::HashMap, fs, io::Write, os::unix::fs::OpenOptionsExt, path::PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -103,8 +103,14 @@ impl State {
                 .and_then(|name| name.to_str())
                 .unwrap_or("state")
         ));
-        let mut file = fs::File::create(&tmp)?;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        // Create the file already private rather than widening it afterwards,
+        // so the device inventory is never briefly world-readable.
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
         serde_json::to_writer_pretty(&mut file, &self.persistent)?;
         file.write_all(b"\n")?;
         file.sync_all()?;
@@ -131,5 +137,17 @@ mod tests {
         state.set_disconnected("pci:0000:00:1f.3", false).unwrap();
         let reloaded = State::load(true, &path);
         assert!(reloaded.persistent.disconnected_devices.is_empty());
+    }
+
+    #[test]
+    fn writes_the_state_file_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut state = State::load(true, &path);
+        state.select_vm("usb-046d:c52b:None", "gui-vm").unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }

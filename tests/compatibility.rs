@@ -5,7 +5,7 @@ use std::{
     collections::VecDeque,
     ffi::OsStr,
     fs,
-    os::unix::fs::symlink,
+    os::unix::fs::{PermissionsExt, symlink},
     path::Path,
     sync::{Arc, Mutex},
     time::Duration,
@@ -353,6 +353,23 @@ async fn unix_wire_protocol_is_newline_delimited_json() {
     let response = serde_json::to_value(response).unwrap();
     assert_eq!(response["result"], "ok");
     assert_eq!(response["usb_devices"][0]["product_name"], "USB Receiver");
+    server.abort();
+}
+
+#[tokio::test]
+async fn api_socket_is_not_reachable_beyond_its_owner_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("api.sock");
+    let manager = Arc::new(manager(&dir, Some(&socket)));
+    let server = tokio::spawn(api::serve(Arc::clone(&manager)));
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mode = fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "unconfigured API socket must stay owner-only");
     server.abort();
 }
 

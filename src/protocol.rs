@@ -197,7 +197,7 @@ impl Response {
 }
 
 impl TryInto<ResponsePayload> for Response {
-    type Error =  anyhow::Error;
+    type Error = anyhow::Error;
 
     fn try_into(self) -> Result<ResponsePayload, Self::Error> {
         match self {

@@ -13,6 +13,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, UnixListener},
+    sync::{OwnedSemaphorePermit, Semaphore},
     task::JoinSet,
 };
 use tokio_util::codec::{Framed, LinesCodec};
@@ -31,6 +32,24 @@ use crate::{
 
 const MAX_MESSAGE: usize = 1024 * 1024;
 
+/// Concurrent API connections served at once, across all transports. Clients
+/// beyond this wait in the kernel backlog rather than each costing the daemon a
+/// file descriptor, a `MAX_MESSAGE` buffer and a notification subscription.
+const MAX_CONNECTIONS: usize = 64;
+
+/// Applied after a failed `accept`, so a listener that keeps failing (out of
+/// file descriptors, for instance) cannot spin the CPU.
+const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// `accept` failures are usually transient and caller-induced: an aborted
+/// handshake, or the descriptor table being full. Dropping the listener on one
+/// of those would let any client that can reach a transport stop the daemon, so
+/// they are logged and retried instead.
+async fn accept_failed(transport: &str, error: &std::io::Error) {
+    warn!(transport, %error, "failed to accept API connection");
+    tokio::time::sleep(ACCEPT_BACKOFF).await;
+}
+
 pub async fn serve<R: CommandRunner + 'static>(manager: Arc<DeviceManager<R>>) -> Result<()> {
     if !manager.config.general.api.enable {
         std::future::pending::<()>().await;
@@ -42,9 +61,11 @@ pub async fn serve<R: CommandRunner + 'static>(manager: Arc<DeviceManager<R>>) -
         return Ok(());
     }
     let transports = api.transports.clone();
+    let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let mut tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();
     for transport in transports {
         let manager = manager.clone();
+        let connections = Arc::clone(&connections);
         match transport {
             ApiTransport::Unix => {
                 let path = &api.unix_socket;
@@ -65,8 +86,11 @@ pub async fn serve<R: CommandRunner + 'static>(manager: Arc<DeviceManager<R>>) -
                 info!(path = %path.display(), "API listening on Unix socket");
                 tasks.spawn(async move {
                     loop {
-                        let (stream, _) = listener.accept().await?;
-                        tokio::spawn(connection(Arc::clone(&manager), stream));
+                        let permit = Arc::clone(&connections).acquire_owned().await?;
+                        match listener.accept().await {
+                            Ok((stream, _)) => spawn_connection(&manager, stream, permit),
+                            Err(error) => accept_failed("unix", &error).await,
+                        }
                     }
                 });
             }
@@ -79,8 +103,11 @@ pub async fn serve<R: CommandRunner + 'static>(manager: Arc<DeviceManager<R>>) -
                 info!(%address, "API listening on TCP");
                 tasks.spawn(async move {
                     loop {
-                        let (stream, _) = listener.accept().await?;
-                        tokio::spawn(connection(Arc::clone(&manager), stream));
+                        let permit = Arc::clone(&connections).acquire_owned().await?;
+                        match listener.accept().await {
+                            Ok((stream, _)) => spawn_connection(&manager, stream, permit),
+                            Err(error) => accept_failed("tcp", &error).await,
+                        }
                     }
                 });
             }
@@ -92,12 +119,19 @@ pub async fn serve<R: CommandRunner + 'static>(manager: Arc<DeviceManager<R>>) -
                 info!(port, "API listening on VSOCK");
                 tasks.spawn(async move {
                     loop {
-                        let (stream, address) = listener.accept().await?;
+                        let permit = Arc::clone(&connections).acquire_owned().await?;
+                        let (stream, address) = match listener.accept().await {
+                            Ok(accepted) => accepted,
+                            Err(error) => {
+                                accept_failed("vsock", &error).await;
+                                continue;
+                            }
+                        };
                         if !allowed.is_empty() && !allowed.contains(&address.cid()) {
                             warn!(cid = address.cid(), "rejected VSOCK client");
                             continue;
                         }
-                        tokio::spawn(connection(Arc::clone(&manager), stream));
+                        spawn_connection(&manager, stream, permit);
                     }
                 });
             }
@@ -108,6 +142,20 @@ pub async fn serve<R: CommandRunner + 'static>(manager: Arc<DeviceManager<R>>) -
         None => bail!("no API transports configured"),
     }
     Ok(())
+}
+
+/// Serves one accepted client, holding `permit` until the connection closes so
+/// the slot is only returned once the resources really are.
+fn spawn_connection<R, S>(manager: &Arc<DeviceManager<R>>, stream: S, permit: OwnedSemaphorePermit)
+where
+    R: CommandRunner + 'static,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let manager = Arc::clone(manager);
+    tokio::spawn(async move {
+        connection(manager, stream).await;
+        drop(permit);
+    });
 }
 
 async fn connection<R, S>(manager: Arc<DeviceManager<R>>, stream: S)
@@ -172,10 +220,12 @@ where
         },
         Err(error) => Response::failed(format!("Invalid API message: {error}")),
     };
-    framed
-        .send(serde_json::to_string(&response).unwrap())
-        .await
-        .is_ok()
+    // `Response` is a plain string/array structure, so encoding cannot actually
+    // fail; dropping the connection is still a better answer than a panic.
+    let Ok(encoded) = serde_json::to_string(&response) else {
+        return false;
+    };
+    framed.send(encoded).await.is_ok()
 }
 
 pub async fn handle<R: CommandRunner>(manager: &DeviceManager<R>, message: Action) -> Response {
@@ -238,12 +288,17 @@ async fn handle_inner<R: CommandRunner>(
     }
 }
 
+/// `bind` publishes the socket under the process umask, which a unit file is
+/// free to set to `0000`. Narrowing it to owner-only first means the socket is
+/// never reachable by anyone the configuration did not name; ownership is
+/// applied before `unixSocketMode` widens it again.
 fn configure_unix_socket(
     path: &Path,
     user: Option<&str>,
     group: Option<&str>,
     mode: Option<&str>,
 ) -> Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     let uid = user.map(user_id).transpose()?;
     let gid = group.map(group_id).transpose()?;
     if uid.is_some() || gid.is_some() {
