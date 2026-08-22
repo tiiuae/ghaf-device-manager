@@ -787,6 +787,30 @@ impl<R: CommandRunner> DeviceManager<R> {
         }
         for (key, device) in observed_usb.iter() {
             if !usb.contains_key(key) {
+                let binding = self
+                    .state
+                    .lock()
+                    .await
+                    .persistent
+                    .crosvm_usb_ports
+                    .get(key)
+                    .cloned();
+                if let Some(binding) = binding {
+                    let vm = self.config.vm(&binding.vm)?;
+                    if vm.socket.exists()
+                        && binding.socket_generation
+                            == socket_generation(&vm.socket).unwrap_or_default()
+                    {
+                        let live = self.crosvm.usb_list(&vm.socket).await?;
+                        if live.iter().any(|item| {
+                            item.0 == binding.port
+                                && Some(&item.1) == binding.vid.as_ref()
+                                && Some(&item.2) == binding.pid.as_ref()
+                        }) {
+                            self.crosvm.usb_detach(&vm.socket, binding.port).await?;
+                        }
+                    }
+                }
                 self.notify(json!({
                     "event": "usb_disconnected",
                     "usb_device": {"device_node": device.device_node},
