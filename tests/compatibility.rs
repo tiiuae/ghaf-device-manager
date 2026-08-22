@@ -649,6 +649,92 @@ async fn reconciliation_reuses_live_binding_and_replaces_it_for_a_new_socket() {
 }
 
 #[tokio::test]
+async fn reconciliation_detaches_replaced_usb_port_in_the_same_vm() {
+    let dir = tempfile::tempdir().unwrap();
+    let usb = dir.path().join("sys/usb");
+    let pci = dir.path().join("sys/pci/devices");
+    let state = dir.path().join("state.json");
+    let socket = dir.path().join("vm.sock");
+    usb_fixture(&usb);
+    pci_fixture(&pci);
+    write(&socket, "one generation");
+
+    let mut config = config(&state, &socket, None);
+    config.pci_passthrough.clear();
+    config.usb_passthrough[0]["targetVm"] = json!("gui-vm");
+    let outputs = Arc::new(Mutex::new(VecDeque::from([
+        Output {
+            status: 0,
+            stdout: "devices".into(),
+            stderr: String::new(),
+        },
+        Output {
+            status: 0,
+            stdout: "devices".into(),
+            stderr: String::new(),
+        },
+        Output {
+            status: 0,
+            stdout: "ok 3".into(),
+            stderr: String::new(),
+        },
+        Output {
+            status: 0,
+            stdout: "devices 3 046d c52b".into(),
+            stderr: String::new(),
+        },
+        Output {
+            status: 0,
+            stdout: "devices 3 046d c52b".into(),
+            stderr: String::new(),
+        },
+        Output {
+            status: 0,
+            stdout: "ok 4".into(),
+            stderr: String::new(),
+        },
+        Output {
+            status: 0,
+            stdout: "ok 3".into(),
+            stderr: String::new(),
+        },
+    ])));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let manager = DeviceManager::with_roots(
+        config,
+        RecordingCommands {
+            outputs: Arc::clone(&outputs),
+            calls: Arc::clone(&calls),
+        },
+        usb.clone(),
+        pci,
+    )
+    .unwrap();
+
+    manager.reconcile().await.unwrap();
+    write(usb.join("1-2.3/serial"), "000001\n");
+    manager.reconcile().await.unwrap();
+
+    let calls = calls.lock().unwrap();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|args| args.windows(2).any(|pair| pair == ["usb", "attach"]))
+            .count(),
+        2
+    );
+    assert!(calls.iter().any(|args| {
+        args.windows(3)
+            .any(|triple| triple == ["usb", "detach", "3"])
+    }));
+    assert!(outputs.lock().unwrap().is_empty());
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&state).unwrap()).unwrap();
+    assert_eq!(state["crosvm_usb_ports"]["1-2.3"]["port"], 4);
+    assert_eq!(state["crosvm_usb_ports"]["1-2.3"]["serial"], "000001");
+}
+
+#[tokio::test]
 async fn reconciliation_does_not_repeat_unchanged_pci_attachment_notification() {
     let dir = tempfile::tempdir().unwrap();
     let usb = dir.path().join("sys/usb");
