@@ -310,10 +310,23 @@ impl<R: CommandRunner> DeviceManager<R> {
                 .get(&device.sys_name)
                 .cloned()
         };
+        let generation = socket_generation(&vm.socket).unwrap_or_default();
         let live = self.crosvm.usb_list(&vm.socket).await?;
+        let stale_port = known
+            .as_ref()
+            .filter(|binding| binding.vm == vm_name && binding.socket_generation == generation)
+            .and_then(|binding| {
+                live.iter()
+                    .find(|item| {
+                        item.0 == binding.port
+                            && Some(&item.1) == binding.vid.as_ref()
+                            && Some(&item.2) == binding.pid.as_ref()
+                    })
+                    .map(|item| item.0)
+            });
         let port = if let Some(binding) = known.filter(|binding| {
             binding.vm == vm_name
-                && binding.socket_generation == socket_generation(&vm.socket).unwrap_or_default()
+                && binding.socket_generation == generation
                 && binding.vid == device.vid
                 && binding.pid == device.pid
                 && binding.serial == device.serial
@@ -326,11 +339,19 @@ impl<R: CommandRunner> DeviceManager<R> {
                 binding.port
             } else {
                 attachment_changed = true;
-                self.crosvm.usb_attach(&vm.socket, device_node).await?
+                let port = self.crosvm.usb_attach(&vm.socket, device_node).await?;
+                if let Some(stale_port) = stale_port.filter(|stale| *stale != port) {
+                    self.crosvm.usb_detach(&vm.socket, stale_port).await?;
+                }
+                port
             }
         } else {
             attachment_changed = true;
-            self.crosvm.usb_attach(&vm.socket, device_node).await?
+            let port = self.crosvm.usb_attach(&vm.socket, device_node).await?;
+            if let Some(stale_port) = stale_port.filter(|stale| *stale != port) {
+                self.crosvm.usb_detach(&vm.socket, stale_port).await?;
+            }
+            port
         };
         let mut state = self.state.lock().await;
         state
@@ -343,7 +364,7 @@ impl<R: CommandRunner> DeviceManager<R> {
             UsbPortBinding {
                 vm: vm_name.clone(),
                 port,
-                socket_generation: socket_generation(&vm.socket).unwrap_or_default(),
+                socket_generation: generation,
                 vid: device.vid.clone(),
                 pid: device.pid.clone(),
                 serial: device.serial.clone(),
@@ -766,6 +787,30 @@ impl<R: CommandRunner> DeviceManager<R> {
         }
         for (key, device) in observed_usb.iter() {
             if !usb.contains_key(key) {
+                let binding = self
+                    .state
+                    .lock()
+                    .await
+                    .persistent
+                    .crosvm_usb_ports
+                    .get(key)
+                    .cloned();
+                if let Some(binding) = binding {
+                    let vm = self.config.vm(&binding.vm)?;
+                    if vm.socket.exists()
+                        && binding.socket_generation
+                            == socket_generation(&vm.socket).unwrap_or_default()
+                    {
+                        let live = self.crosvm.usb_list(&vm.socket).await?;
+                        if live.iter().any(|item| {
+                            item.0 == binding.port
+                                && Some(&item.1) == binding.vid.as_ref()
+                                && Some(&item.2) == binding.pid.as_ref()
+                        }) {
+                            self.crosvm.usb_detach(&vm.socket, binding.port).await?;
+                        }
+                    }
+                }
                 self.notify(json!({
                     "event": "usb_disconnected",
                     "usb_device": {"device_node": device.device_node},
