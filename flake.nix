@@ -15,6 +15,10 @@
       forAllSystems = nixpkgs.lib.genAttrs systems;
     in
     {
+      overlays.default = final: _prev: {
+        ghaf-device-manager = final.callPackage ./nix/package.nix { };
+      };
+
       packages = forAllSystems (
         system:
         let
