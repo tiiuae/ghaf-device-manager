@@ -23,6 +23,31 @@ fn hex(path: impl AsRef<Path>) -> Option<u32> {
     u32::from_str_radix(read(path)?.trim_start_matches("0x"), 16).ok()
 }
 
+/// Matches vhotplug's naming: hwdb-derived vendor/product names take priority
+/// over a device's own (often missing or generic) USB descriptor strings.
+fn hwdb_names(
+    hwdb: Option<&udev::Hwdb>,
+    vid: Option<&str>,
+    pid: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let Some(hwdb) = hwdb else {
+        return (None, None);
+    };
+    let Some((vid, pid)) = vid.zip(pid) else {
+        return (None, None);
+    };
+    let modalias = format!("usb:v{}p{}", vid.to_uppercase(), pid.to_uppercase());
+    let lookup = |name: &str| {
+        hwdb.query_one(modalias.as_str(), name)
+            .and_then(|value| value.to_str())
+            .map(str::to_owned)
+    };
+    (
+        lookup("ID_VENDOR_FROM_DATABASE"),
+        lookup("ID_MODEL_FROM_DATABASE"),
+    )
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UsbInterface {
     pub class: Option<u32>,
@@ -103,6 +128,7 @@ impl PciDevice {
 
 pub(crate) fn scan_usb(root: &Path) -> Result<Vec<UsbDevice>> {
     let protect_host_storage = root == Path::new("/sys/bus/usb/devices");
+    let hwdb = udev::Hwdb::new().ok();
     let mut devices = Vec::new();
     for entry in fs::read_dir(root).with_context(|| format!("failed to scan {}", root.display()))? {
         let entry = entry?;
@@ -146,11 +172,15 @@ pub(crate) fn scan_usb(root: &Path) -> Result<Vec<UsbDevice>> {
         }
         let vid = read(path.join("idVendor"));
         let pid = read(path.join("idProduct"));
-        let product_name = read(path.join("product")).or_else(|| {
-            vid.as_ref()
-                .zip(pid.as_ref())
-                .map(|(vid, pid)| format!("USB device {vid}:{pid}"))
-        });
+        let (hwdb_vendor, hwdb_product) = hwdb_names(hwdb.as_ref(), vid.as_deref(), pid.as_deref());
+        let vendor_name = hwdb_vendor.or_else(|| read(path.join("manufacturer")));
+        let product_name = hwdb_product
+            .or_else(|| read(path.join("product")))
+            .or_else(|| {
+                vid.as_ref()
+                    .zip(pid.as_ref())
+                    .map(|(vid, pid)| format!("USB device {vid}:{pid}"))
+            });
         let interfaces_text = (!interfaces.is_empty()).then(|| {
             format!(
                 ":{}:",
@@ -174,7 +204,7 @@ pub(crate) fn scan_usb(root: &Path) -> Result<Vec<UsbDevice>> {
             root_port,
             vid,
             pid,
-            vendor_name: read(path.join("manufacturer")),
+            vendor_name,
             product_name,
             serial: read(path.join("serial")),
             removable: read(path.join("removable")),
