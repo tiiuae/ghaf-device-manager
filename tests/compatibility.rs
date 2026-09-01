@@ -981,6 +981,182 @@ async fn a_new_usb_bus_gets_its_root_hub_interface_probed() {
     );
 }
 
+/// A manager wired to the gated bus with `outputs` scripted for crosvm.
+fn scripted_gated_manager(
+    dir: &tempfile::TempDir,
+    bus: &Path,
+    outputs: VecDeque<Output>,
+) -> DeviceManager<ScriptedCommands> {
+    DeviceManager::with_roots(
+        config(
+            &dir.path().join("state.json"),
+            &dir.path().join("vm.sock"),
+            None,
+        ),
+        ScriptedCommands {
+            outputs: Mutex::new(outputs),
+        },
+        bus.join("devices"),
+        dir.path().join("sys/pci/devices"),
+    )
+    .unwrap()
+}
+
+fn crosvm_attach_outputs() -> VecDeque<Output> {
+    VecDeque::from([
+        Output {
+            status: 0,
+            stdout: "devices".into(),
+            stderr: String::new(),
+        },
+        Output {
+            status: 0,
+            stdout: "devices".into(),
+            stderr: String::new(),
+        },
+        Output {
+            status: 0,
+            stdout: "ok 3".into(),
+            stderr: String::new(),
+        },
+    ])
+}
+
+#[tokio::test]
+async fn reopening_the_gate_hands_unheld_devices_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let bus = gated_bus(&dir);
+    let manager = gated_manager(&dir, &bus);
+
+    manager.close_usb_gate().unwrap();
+    manager.open_usb_gate().await.unwrap();
+
+    assert_eq!(
+        fs::read_to_string(bus.join("drivers_autoprobe")).unwrap(),
+        "1"
+    );
+    assert_eq!(
+        fs::read_to_string(bus.join("drivers_probe")).unwrap(),
+        "1-2.3:1.0"
+    );
+}
+
+/// A guest that has not claimed every interface leaves them reading as
+/// driverless: probing a host driver onto one would put host and guest on the
+/// same device at once, which is the corruption the gate exists to prevent.
+#[tokio::test]
+async fn reopening_the_gate_leaves_a_vm_held_device_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let bus = gated_bus(&dir);
+    let manager = scripted_gated_manager(&dir, &bus, crosvm_attach_outputs());
+    let selector = Selector {
+        vid: Some("046d".into()),
+        pid: Some("c52b".into()),
+        ..Default::default()
+    };
+    manager.attach_usb(&selector, Some("gui-vm")).await.unwrap();
+
+    manager.close_usb_gate().unwrap();
+    manager.open_usb_gate().await.unwrap();
+
+    assert_eq!(
+        fs::read_to_string(bus.join("drivers_autoprobe")).unwrap(),
+        "1"
+    );
+    assert!(!bus.join("drivers_probe").exists());
+}
+
+/// A device handed back to the host on purpose stops counting as routed:
+/// staying unbound would leave it dead on the host and unattached to any VM.
+#[tokio::test]
+async fn a_device_marked_disconnected_keeps_its_host_driver() {
+    let dir = tempfile::tempdir().unwrap();
+    let bus = gated_bus(&dir);
+    write(
+        dir.path().join("state.json"),
+        r#"{"selected_vms":{},"disconnected_devices":["usb-046d:c52b:None"],"crosvm_usb_ports":{}}"#,
+    );
+    bind(&bus, "1-2.3:1.0", "uas");
+    let manager = gated_manager(&dir, &bus);
+
+    manager.reconcile().await.unwrap();
+
+    assert!(!bus.join("drivers/uas/unbind").exists());
+}
+
+/// A `driverPath` rule only matches while a driver is bound, and the gate
+/// takes that driver off: without a remembered verdict the device would be
+/// rebound and unbound on every pass.
+#[tokio::test]
+async fn a_driver_path_rule_does_not_rebind_what_it_just_released() {
+    let dir = tempfile::tempdir().unwrap();
+    let bus = gated_bus(&dir);
+    let usb = bus.join("devices");
+    let other = usb.join("1-4");
+    write(other.join("idVendor"), "1234\n");
+    write(other.join("idProduct"), "5678\n");
+    write(other.join("busnum"), "1\n");
+    write(other.join("devnum"), "5\n");
+    // No valid interface class is what makes a driverPath rule apply at all.
+    write(usb.join("1-4:1.0/bInterfaceClass"), "ff\n");
+    bind(&bus, "1-4:1.0", "uas");
+    let mut config = config(
+        &dir.path().join("state.json"),
+        &dir.path().join("vm.sock"),
+        None,
+    );
+    config.usb_passthrough = vec![json!({
+        "targetVm": "gui-vm",
+        "allow": [{"driverPath": ".*/drivers/uas"}]
+    })];
+    let manager = DeviceManager::with_roots(
+        config,
+        NoCommands,
+        usb.clone(),
+        dir.path().join("sys/pci/devices"),
+    )
+    .unwrap();
+
+    manager.reconcile().await.unwrap();
+    assert_eq!(
+        fs::read_to_string(bus.join("drivers/uas/unbind")).unwrap(),
+        "1-4:1.0"
+    );
+    // The unbind the kernel would have done, so the next pass sees no driver.
+    fs::remove_file(usb.join("1-4:1.0/driver")).unwrap();
+
+    manager.reconcile().await.unwrap();
+
+    // 1-2.3 is the only unrouted device left, so it holds the last probe:
+    // 1-4:1.0 was not handed back to the host.
+    assert_eq!(
+        fs::read_to_string(bus.join("drivers_probe")).unwrap(),
+        "1-2.3:1.0"
+    );
+}
+
+/// A rule matching a hub is a misconfiguration to report once, not an error
+/// to raise on every pass: raising it pins the reconcile loop at its retry
+/// interval for as long as the rule stands.
+#[tokio::test]
+async fn a_rule_matching_a_hub_is_skipped_rather_than_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let bus = gated_bus(&dir);
+    bind(&bus, "1-2.3:1.0", "hub");
+    let manager = gated_manager(&dir, &bus);
+    let selector = Selector {
+        vid: Some("046d".into()),
+        pid: Some("c52b".into()),
+        ..Default::default()
+    };
+
+    // NoCommands would fail the attach, so reaching crosvm at all is a failure.
+    manager.attach_usb(&selector, Some("gui-vm")).await.unwrap();
+    manager.reconcile().await.unwrap();
+
+    assert!(!bus.join("drivers/hub/unbind").exists());
+}
+
 #[tokio::test]
 async fn a_deployment_that_routes_no_usb_keeps_stock_kernel_binding() {
     for disabled_rule in [false, true] {
@@ -1009,10 +1185,14 @@ async fn a_deployment_that_routes_no_usb_keeps_stock_kernel_binding() {
 
         assert!(!manager.close_usb_gate().unwrap());
         manager.reconcile().await.unwrap();
+        // The shutdown path runs even where nothing was gated: it must not
+        // write the attribute a host set for itself, nor probe anything.
+        write(bus.join("drivers_autoprobe"), "0");
+        manager.open_usb_gate().await.unwrap();
 
         assert_eq!(
             fs::read_to_string(bus.join("drivers_autoprobe")).unwrap(),
-            "1"
+            "0"
         );
         assert!(!bus.join("drivers_probe").exists());
     }

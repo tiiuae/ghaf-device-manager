@@ -50,16 +50,26 @@ async fn run() -> Result<()> {
     // Registered before the gate closes: a stop landing anywhere in the
     // startup window must still reach the restore below.
     let shutdown = shutdown()?;
-    if manager.close_usb_gate()? {
-        info!("host drivers now bind only to USB devices that no rule routes");
+    // Not fatal: a host where the attribute is not writable ran ungated
+    // before this existed, and everything else the manager does still works.
+    match manager.close_usb_gate() {
+        Ok(true) => info!("host drivers now bind only to USB devices that no rule routes"),
+        Ok(false) => {}
+        Err(error) => warn!(%error, "continuing without gating host USB driver binding"),
     }
     // Every way out of daemon() passes the reopen below, early failures
     // included: exiting with the gate closed would leave USB hotplug dead.
     let outcome = daemon(&args, &manager, shutdown).await;
     // An API connection racing this reopen can release one interface a
     // moment late; the next daemon start probes it back.
-    if let Err(error) = manager.open_usb_gate() {
-        warn!(%error, "failed to hand USB driver binding back to the kernel");
+    //
+    // Failing here leaves USB hotplug dead host-wide, so it is loud and it
+    // decides the exit status: a silent success would tell systemd nothing.
+    if let Err(error) = manager.open_usb_gate().await {
+        error!(error = %format!("{error:#}"), "failed to hand USB driver binding back to the kernel");
+        return outcome.and(Err(
+            error.context("USB driver binding was left with the manager")
+        ));
     }
     outcome
 }
