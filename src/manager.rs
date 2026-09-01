@@ -25,6 +25,7 @@ use crate::{
     protocol::{PciListDevice, UsbListDevice},
     state::{State, UsbPortBinding},
     unix_ids::{group_id, user_id},
+    usb_gate,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -101,6 +102,105 @@ impl<R: CommandRunner> DeviceManager<R> {
             .into_iter()
             .filter_map(|device| self.config.usb_rule(&device).map(|rule| (device, rule)))
             .collect())
+    }
+
+    /// The bus directory holding the device root, only where the kernel
+    /// exposes the attribute: a temporary root in a test never provides it.
+    fn usb_bus(&self) -> Option<&Path> {
+        let bus = self.usb_root.parent()?;
+        bus.join(usb_gate::AUTOPROBE).exists().then_some(bus)
+    }
+
+    /// Reports `false` where there is nothing to gate: no bus, or no enabled
+    /// USB rules. The reopen below deliberately skips the rules guard, so a
+    /// gate left closed by a crash reopens even after the rules are removed.
+    pub fn close_usb_gate(&self) -> Result<bool> {
+        let Some(bus) = self.usb_bus().filter(|_| self.config.routes_usb()) else {
+            return Ok(false);
+        };
+        usb_gate::close(bus)?;
+        Ok(true)
+    }
+
+    /// Restoring the attribute covers only future hotplug, so everything the
+    /// gate left driverless is probed back as well.
+    pub fn open_usb_gate(&self) -> Result<()> {
+        let Some(bus) = self.usb_bus() else {
+            return Ok(());
+        };
+        usb_gate::open(bus)?;
+        for name in usb_gate::device_names(&self.usb_root)? {
+            if usb_gate::driver(&self.usb_root, &name).is_none()
+                && let Err(error) = usb_gate::probe(bus, &name)
+            {
+                warn!(%error, device = %name, "failed to hand a USB device back");
+            }
+            let interfaces = match usb_gate::interfaces(&self.usb_root, &name) {
+                Ok(interfaces) => interfaces,
+                Err(error) => {
+                    warn!(%error, device = %name, "failed to list interfaces");
+                    continue;
+                }
+            };
+            for interface in interfaces {
+                if usb_gate::driver(&self.usb_root, &interface).is_none()
+                    && let Err(error) = usb_gate::probe(bus, &interface)
+                {
+                    warn!(%error, interface = %interface, "failed to hand an interface back");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Probing every device first is what creates the interfaces the rules
+    /// are matched against, so a routed device reads as it did ungated.
+    fn apply_usb_gate(&self) -> Result<()> {
+        let Some(bus) = self.usb_bus() else {
+            return Ok(());
+        };
+        if !self.config.routes_usb() {
+            return Ok(());
+        }
+        // Re-asserted every pass: a failed second daemon start reopens the
+        // gate on its way out, and nothing else would close it again.
+        usb_gate::close(bus)?;
+        for name in usb_gate::device_names(&self.usb_root)? {
+            if usb_gate::driver(&self.usb_root, &name).is_none()
+                && let Err(error) = usb_gate::probe(bus, &name)
+            {
+                warn!(%error, device = %name, "failed to configure a USB device");
+            }
+        }
+        let routed = scan_usb(&self.usb_root)?
+            .into_iter()
+            .filter(|device| self.config.usb_rule(device).is_some())
+            .map(|device| device.sys_name)
+            .collect::<HashSet<_>>();
+        for name in usb_gate::device_names(&self.usb_root)? {
+            let is_routed = routed.contains(&name);
+            let interfaces = match usb_gate::interfaces(&self.usb_root, &name) {
+                Ok(interfaces) => interfaces,
+                Err(error) => {
+                    warn!(%error, device = %name, "failed to list interfaces");
+                    continue;
+                }
+            };
+            for interface in interfaces {
+                let driver = usb_gate::driver(&self.usb_root, &interface);
+                let outcome = match (is_routed, driver.as_deref()) {
+                    (true, Some(driver)) if usb_gate::releasable(driver) => {
+                        usb_gate::release(&self.usb_root, &interface)
+                    }
+                    (false, None) => usb_gate::probe(bus, &interface),
+                    _ => Ok(()),
+                };
+                if let Err(error) = outcome {
+                    warn!(%error, interface = %interface, "failed to settle a host driver");
+                }
+            }
+        }
+        Ok(())
     }
 
     fn pci_devices(&self) -> Result<Vec<(PciDevice, RuleMatch)>> {
@@ -301,6 +401,24 @@ impl<R: CommandRunner> DeviceManager<R> {
         let mut attachment_changed = current_vm.as_deref() != Some(vm_name.as_str());
         if current_vm.as_deref().is_some_and(|name| name != vm_name) {
             self.detach_one_usb(device, false).await?;
+        }
+        // A claim detaches any bound host driver mid-command, which wedges
+        // some bridge firmware for good: take drivers off first, as bind_vfio
+        // does for PCI. A usbfs binding is a VM's own claim and stays.
+        for interface in usb_gate::interfaces(&self.usb_root, &device.sys_name)
+            .with_context(|| format!("cannot claim {}", device.sys_name))?
+        {
+            match usb_gate::driver(&self.usb_root, &interface).as_deref() {
+                Some(usb_gate::HUB) => bail!(
+                    "refusing to claim {}: {interface} is a hub, and a claim would collapse its subtree",
+                    device.sys_name
+                ),
+                Some(driver) if driver != usb_gate::CLAIM => {
+                    usb_gate::release(&self.usb_root, &interface)
+                        .with_context(|| format!("cannot claim {}", device.sys_name))?;
+                }
+                _ => {}
+            }
         }
         let known = {
             let state = self.state.lock().await;
@@ -757,6 +875,9 @@ impl<R: CommandRunner> DeviceManager<R> {
 
     pub async fn reconcile(&self) -> Result<()> {
         self.deferred.store(false, Ordering::Relaxed);
+        if let Err(error) = self.apply_usb_gate() {
+            warn!(%error, "failed to settle host USB drivers");
+        }
         self.observe().await?;
         let mut failures = Vec::new();
         if let Err(error) = self.resume_pci(None).await {

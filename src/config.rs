@@ -456,6 +456,13 @@ impl Config {
         None
     }
 
+    /// Whether any enabled USB rule exists: a deployment that routes no USB
+    /// has nothing to gate.
+    #[must_use]
+    pub(crate) fn routes_usb(&self) -> bool {
+        self.usb_passthrough.iter().any(enabled)
+    }
+
     #[must_use]
     pub(crate) fn has_pci_rules(&self, vm: &str) -> bool {
         self.pci_passthrough

@@ -1,15 +1,16 @@
 // SPDX-FileCopyrightText: 2026 TII (SSRC) and the Ghaf contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{future::Future, path::PathBuf, sync::Arc, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use clap::Parser;
 use ghaf_device_manager::{Config, DeviceManager, ProcessRunner, api};
 use tokio::io::unix::AsyncFd;
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 use tokio::task::LocalSet;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 const RECONCILE_RETRY_INTERVAL: Duration = Duration::from_secs(2);
@@ -46,6 +47,32 @@ async fn run() -> Result<()> {
         .init();
     let config = Config::load(&args.config)?;
     let manager = Arc::new(DeviceManager::new(config, ProcessRunner)?);
+    // Registered before the gate closes: a stop landing anywhere in the
+    // startup window must still reach the restore below.
+    let shutdown = shutdown()?;
+    if manager.close_usb_gate()? {
+        info!("host drivers now bind only to USB devices that no rule routes");
+    }
+    // Every way out of daemon() passes the reopen below, early failures
+    // included: exiting with the gate closed would leave USB hotplug dead.
+    let outcome = daemon(&args, &manager, shutdown).await;
+    // An API connection racing this reopen can release one interface a
+    // moment late; the next daemon start probes it back.
+    if let Err(error) = manager.open_usb_gate() {
+        warn!(%error, "failed to hand USB driver binding back to the kernel");
+    }
+    outcome
+}
+
+async fn daemon(
+    args: &Args,
+    manager: &Arc<DeviceManager<ProcessRunner>>,
+    shutdown: impl Future<Output = ()>,
+) -> Result<()> {
+    // Subscribed before the first scan, so an add event racing that scan
+    // queues instead of vanishing into the 30 second safety interval.
+    let (events, mut receiver) = mpsc::channel::<()>(8);
+    spawn_udev_monitor(events)?;
     let initial_reconcile_succeeded = if args.attach_connected {
         match manager.reconcile().await {
             Ok(()) => !manager.deferred(),
@@ -57,10 +84,8 @@ async fn run() -> Result<()> {
     } else {
         false
     };
-    let (events, mut receiver) = mpsc::channel::<()>(8);
-    spawn_udev_monitor(events)?;
-    let reconcile = Arc::clone(&manager);
-    let event_task = tokio::spawn(async move {
+    let reconcile = Arc::clone(manager);
+    let mut event_task = tokio::spawn(async move {
         let mut delay = if initial_reconcile_succeeded {
             RECONCILE_SAFETY_INTERVAL
         } else {
@@ -86,12 +111,36 @@ async fn run() -> Result<()> {
             };
         }
     });
-    tokio::select! {
-        result = api::serve(Arc::clone(&manager)) => result?,
-        _ = tokio::signal::ctrl_c() => {},
-    }
+    let outcome = tokio::select! {
+        result = api::serve(Arc::clone(manager)) => result,
+        // The reconcile loop is the only thing that ever binds a driver
+        // while the gate is closed, so its death is the daemon's death.
+        stopped = &mut event_task => Err(match stopped {
+            Ok(()) => anyhow!("device reconciliation stopped"),
+            Err(error) => anyhow!("device reconciliation panicked: {error}"),
+        }),
+        () = shutdown => Ok(()),
+    };
     event_task.abort();
-    Ok(())
+    // Awaited so no reconcile outlives the gate reopen; skipped when the
+    // select arm consumed the handle, since a second poll panics in tokio.
+    if !event_task.is_finished() {
+        let _ = event_task.await;
+    }
+    outcome
+}
+
+/// SIGTERM and SIGINT both land here. Registration happens at the call,
+/// before the gate closes, so a stop during startup still restores it.
+fn shutdown() -> Result<impl Future<Output = ()>> {
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    Ok(async move {
+        tokio::select! {
+            _ = terminate.recv() => {},
+            _ = interrupt.recv() => {},
+        }
+    })
 }
 
 fn spawn_udev_monitor(sender: mpsc::Sender<()>) -> Result<()> {

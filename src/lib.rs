@@ -10,6 +10,7 @@ pub mod manager;
 pub mod protocol;
 pub mod state;
 mod unix_ids;
+mod usb_gate;
 
 pub use config::Config;
 pub use crosvm::{CommandRunner, Crosvm, ProcessRunner};
