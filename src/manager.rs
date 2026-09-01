@@ -51,6 +51,12 @@ pub struct DeviceManager<R: CommandRunner> {
     observed_usb: Mutex<HashMap<String, UsbDevice>>,
     observed_pci: Mutex<HashMap<String, PciDevice>>,
     pending_usb_selection: Mutex<HashSet<String>>,
+    /// Routing verdict per persistent id, kept because a `driverPath` rule
+    /// only matches while a driver is bound. See `usb_routing`.
+    usb_routing: Mutex<HashMap<String, bool>>,
+    /// Devices already reported as an unroutable hub, so the reconcile loop
+    /// says it once rather than every pass.
+    reported_usb_hubs: Mutex<HashSet<String>>,
     deferred: AtomicBool,
 }
 
@@ -85,6 +91,8 @@ impl<R: CommandRunner> DeviceManager<R> {
             observed_usb: Mutex::new(HashMap::new()),
             observed_pci: Mutex::new(HashMap::new()),
             pending_usb_selection: Mutex::new(HashSet::new()),
+            usb_routing: Mutex::new(HashMap::new()),
+            reported_usb_hubs: Mutex::new(HashSet::new()),
             deferred: AtomicBool::new(false),
         })
     }
@@ -123,13 +131,28 @@ impl<R: CommandRunner> DeviceManager<R> {
     }
 
     /// Restoring the attribute covers only future hotplug, so everything the
-    /// gate left driverless is probed back as well.
-    pub fn open_usb_gate(&self) -> Result<()> {
-        let Some(bus) = self.usb_bus() else {
+    /// gate left driverless is probed back as well. Devices a VM still holds
+    /// are left alone: an interface a guest has not claimed reads as
+    /// driverless, and probing a host driver onto it would put host and guest
+    /// on the same device at once.
+    ///
+    /// A deployment that routes no USB never closed the gate and never probes
+    /// anything back, so a host that deliberately keeps autoprobe off stays
+    /// that way.
+    pub async fn open_usb_gate(&self) -> Result<()> {
+        let Some(bus) = self.usb_bus().filter(|_| self.config.routes_usb()) else {
             return Ok(());
         };
+        if !usb_gate::is_closed(bus) {
+            return Ok(());
+        }
+        let held = self.usb_held_by_vms().await;
         usb_gate::open(bus)?;
         for name in usb_gate::device_names(&self.usb_root)? {
+            if held.contains(&name) {
+                debug!(device = %name, "leaving a VM-held USB device unbound");
+                continue;
+            }
             if usb_gate::driver(&self.usb_root, &name).is_none()
                 && let Err(error) = usb_gate::probe(bus, &name)
             {
@@ -153,9 +176,56 @@ impl<R: CommandRunner> DeviceManager<R> {
         Ok(())
     }
 
+    /// The sys names of devices state records as attached to a VM. Keyed by
+    /// device node, the same key `attach_one_usb` writes.
+    async fn usb_held_by_vms(&self) -> HashSet<String> {
+        let Ok(devices) = scan_usb(&self.usb_root) else {
+            return HashSet::new();
+        };
+        let state = self.state.lock().await;
+        devices
+            .into_iter()
+            .filter(|device| {
+                device
+                    .device_node
+                    .as_deref()
+                    .is_some_and(|node| state.usb_vms.contains_key(node))
+            })
+            .map(|device| device.sys_name)
+            .collect()
+    }
+
+    /// Whether a rule routes this device, remembered across passes.
+    ///
+    /// A `driverPath` rule only matches while a driver is bound, and the gate
+    /// takes that driver off: read fresh every pass, such a device would
+    /// alternate between routed and not, and the bind/unbind cycle that
+    /// follows is what wedges the firmware this gate exists to protect. Once
+    /// routed, a device stays routed for as long as it is plugged in.
+    async fn usb_routing(&self, devices: &[UsbDevice]) -> HashSet<String> {
+        let mut cache = self.usb_routing.lock().await;
+        let state = self.state.lock().await;
+        let mut routed = HashSet::new();
+        let mut seen = HashMap::new();
+        for device in devices {
+            let id = device.persistent_id();
+            let matched = self.config.usb_rule(device).is_some()
+                || cache.get(&id).copied().unwrap_or_default();
+            seen.insert(id.clone(), matched);
+            // A device handed back to the host on purpose is no longer
+            // routed: keeping it unbound would leave it dead on both sides.
+            if matched && !state.disconnected(&id) {
+                routed.insert(device.sys_name.clone());
+            }
+        }
+        // Unplugged devices forget their verdict, so a replug re-decides.
+        *cache = seen;
+        routed
+    }
+
     /// Probing every device first is what creates the interfaces the rules
     /// are matched against, so a routed device reads as it did ungated.
-    fn apply_usb_gate(&self) -> Result<()> {
+    async fn apply_usb_gate(&self) -> Result<()> {
         let Some(bus) = self.usb_bus() else {
             return Ok(());
         };
@@ -172,11 +242,7 @@ impl<R: CommandRunner> DeviceManager<R> {
                 warn!(%error, device = %name, "failed to configure a USB device");
             }
         }
-        let routed = scan_usb(&self.usb_root)?
-            .into_iter()
-            .filter(|device| self.config.usb_rule(device).is_some())
-            .map(|device| device.sys_name)
-            .collect::<HashSet<_>>();
+        let routed = self.usb_routing(&scan_usb(&self.usb_root)?).await;
         for name in usb_gate::device_names(&self.usb_root)? {
             let is_routed = routed.contains(&name);
             let interfaces = match usb_gate::interfaces(&self.usb_root, &name) {
@@ -409,10 +475,19 @@ impl<R: CommandRunner> DeviceManager<R> {
             .with_context(|| format!("cannot claim {}", device.sys_name))?
         {
             match usb_gate::driver(&self.usb_root, &interface).as_deref() {
-                Some(usb_gate::HUB) => bail!(
-                    "refusing to claim {}: {interface} is a hub, and a claim would collapse its subtree",
-                    device.sys_name
-                ),
+                // Reported rather than raised: an error here would fail every
+                // reconcile, pinning the loop at its retry interval for as
+                // long as the misconfigured rule stands.
+                Some(usb_gate::HUB) => {
+                    if self.reported_usb_hubs.lock().await.insert(id.clone()) {
+                        warn!(
+                            device = %device.sys_name,
+                            %interface,
+                            "skipping USB device: it is a hub, and a claim would collapse its subtree"
+                        );
+                    }
+                    return Ok(());
+                }
                 Some(driver) if driver != usb_gate::CLAIM => {
                     usb_gate::release(&self.usb_root, &interface)
                         .with_context(|| format!("cannot claim {}", device.sys_name))?;
@@ -875,7 +950,7 @@ impl<R: CommandRunner> DeviceManager<R> {
 
     pub async fn reconcile(&self) -> Result<()> {
         self.deferred.store(false, Ordering::Relaxed);
-        if let Err(error) = self.apply_usb_gate() {
+        if let Err(error) = self.apply_usb_gate().await {
             warn!(%error, "failed to settle host USB drivers");
         }
         self.observe().await?;

@@ -55,14 +55,28 @@ already holds through `usbfs` is left alone.
 
 The manager hands binding back when it stops, restoring the attribute and
 probing whatever the gate left driverless, so a stopped host behaves as
-stock. After a crash the bus stays gated until the manager restarts, so a
-routed device can never bind a host driver through the gap.
+stock. Devices a VM still holds are left out of that: an interface the guest
+has not claimed reads as driverless, and probing a host driver onto one would
+put host and guest on the same device at once. A deployment that routes no
+USB never writes the attribute at all, on the way in or out, so a host that
+keeps `drivers_autoprobe` off for its own reasons stays that way. After a
+crash the bus stays gated until the manager restarts, so a routed device can
+never bind a host driver through the gap.
 
-Two consequences worth knowing: a routed device marked permanently
-disconnected is inert everywhere, neither attached nor host-bound, until the
-mark is lifted; and a `driverPath` selector matched through a bound driver's
-path matches only intermittently under the gate, so route such devices by
-ids, names or classes instead.
+A routed device marked permanently disconnected is handed back to the host:
+the mark means the device belongs to the host again, so keeping it unbound
+would leave it dead on both sides. It stays host-bound until the mark is
+lifted. A routed device whose VM is not running stays reserved and unbound,
+because it is attached as soon as that VM appears.
+
+A `driverPath` selector matches through a bound driver's path, which the gate
+takes off, so the verdict is remembered for as long as the device stays
+plugged in: such a device is released once and then left alone, rather than
+rebound and released on every pass. Routing by ids, names or classes is still
+the more predictable choice.
+
+A rule matching a hub is reported and skipped rather than obeyed: claiming a
+hub would collapse everything behind it.
 
 ## Security Model
 

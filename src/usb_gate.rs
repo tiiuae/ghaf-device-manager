@@ -20,6 +20,12 @@ pub(crate) fn open(bus: &Path) -> Result<()> {
     autoprobe(bus, "1")
 }
 
+/// Whether the gate is currently shut. A crashed daemon leaves it that
+/// way, which is the only reason a start reopens something it never closed.
+pub(crate) fn is_closed(bus: &Path) -> bool {
+    fs::read_to_string(bus.join(AUTOPROBE)).is_ok_and(|value| value.trim() == "0")
+}
+
 fn autoprobe(bus: &Path, value: &str) -> Result<()> {
     let path = bus.join(AUTOPROBE);
     fs::write(&path, value).with_context(|| format!("failed to write {}", path.display()))
@@ -113,6 +119,16 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), "0");
         open(bus.path()).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "1");
+    }
+
+    #[test]
+    fn is_closed_reads_the_attribute() {
+        let bus = bus();
+        assert!(!is_closed(bus.path()));
+        close(bus.path()).unwrap();
+        assert!(is_closed(bus.path()));
+        open(bus.path()).unwrap();
+        assert!(!is_closed(bus.path()));
     }
 
     #[test]
