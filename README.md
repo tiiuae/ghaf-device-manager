@@ -35,6 +35,35 @@ trees, MMIO ranges, IRQs, BPMP, DCE, and platform devices remain declarative
 Ghaf and microvm.nix configuration. The `vmm args` action is a compatibility
 renderer and does not make those resources hot-pluggable.
 
+## Host Driver Binding
+
+The manager decides which USB devices host drivers may bind to, on
+deployments with USB rules; a configuration that routes no USB keeps stock
+kernel binding untouched. It turns `drivers_autoprobe` off for the USB bus at
+startup, then binds drivers to the devices no rule routes and leaves the rest
+alone. A routed device is never
+bound, because claiming it for a VM detaches the host driver mid-command, and
+that wedges some bridge firmware until the device is power cycled.
+
+USB binds in two stages, which is what makes the split possible: the generic
+device driver sets the configuration and creates the interfaces, and interface
+drivers bind to those. A routed device still gets the first stage, so its
+descriptors and rule matching read as they did before. A device bound before
+the manager started is released through the driver's own disconnect, which
+drains outstanding commands rather than killing them, and a device a VM
+already holds through `usbfs` is left alone.
+
+The manager hands binding back when it stops, restoring the attribute and
+probing whatever the gate left driverless, so a stopped host behaves as
+stock. After a crash the bus stays gated until the manager restarts, so a
+routed device can never bind a host driver through the gap.
+
+Two consequences worth knowing: a routed device marked permanently
+disconnected is inert everywhere, neither attached nor host-bound, until the
+mark is lifted; and a `driverPath` selector matched through a bound driver's
+path matches only intermittently under the gate, so route such devices by
+ids, names or classes instead.
+
 ## Security Model
 
 The API is unauthenticated on every transport. Access control is therefore

@@ -904,3 +904,128 @@ async fn reconciliation_does_not_repeat_unchanged_pci_attachment_notification() 
     );
     assert!(outputs.lock().unwrap().is_empty());
 }
+
+fn gated_bus(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    let bus = dir.path().join("sys/usb");
+    usb_fixture(&bus.join("devices"));
+    pci_fixture(&dir.path().join("sys/pci/devices"));
+    write(bus.join("drivers_autoprobe"), "1");
+    bus
+}
+
+fn bind(bus: &Path, interface: &str, driver: &str) {
+    let target = bus.join("drivers").join(driver);
+    fs::create_dir_all(&target).unwrap();
+    symlink(target, bus.join("devices").join(interface).join("driver")).unwrap();
+}
+
+fn gated_manager(dir: &tempfile::TempDir, bus: &Path) -> DeviceManager<NoCommands> {
+    DeviceManager::with_roots(
+        config(
+            &dir.path().join("state.json"),
+            &dir.path().join("vm.sock"),
+            None,
+        ),
+        NoCommands,
+        bus.join("devices"),
+        dir.path().join("sys/pci/devices"),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn host_drivers_bind_only_to_usb_devices_that_no_rule_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    let bus = gated_bus(&dir);
+    let usb = bus.join("devices");
+    // The routed device arrived before the daemon, so a host driver holds it.
+    bind(&bus, "1-2.3:1.0", "uas");
+    let other = usb.join("1-4");
+    write(other.join("idVendor"), "1234\n");
+    write(other.join("idProduct"), "5678\n");
+    write(other.join("busnum"), "1\n");
+    write(other.join("devnum"), "5\n");
+    write(usb.join("1-4:1.0/bInterfaceClass"), "08\n");
+    let manager = gated_manager(&dir, &bus);
+
+    manager.reconcile().await.unwrap();
+
+    assert_eq!(
+        fs::read_to_string(bus.join("drivers/uas/unbind")).unwrap(),
+        "1-2.3:1.0"
+    );
+    assert_eq!(
+        fs::read_to_string(bus.join("drivers_probe")).unwrap(),
+        "1-4:1.0"
+    );
+}
+
+#[tokio::test]
+async fn a_new_usb_bus_gets_its_root_hub_interface_probed() {
+    let dir = tempfile::tempdir().unwrap();
+    let bus = gated_bus(&dir);
+    let usb = bus.join("devices");
+    let root = usb.join("usb2");
+    write(root.join("idVendor"), "1d6b\n");
+    write(root.join("idProduct"), "0003\n");
+    write(root.join("busnum"), "2\n");
+    write(root.join("devnum"), "1\n");
+    write(usb.join("2-0:1.0/bInterfaceClass"), "09\n");
+    let manager = gated_manager(&dir, &bus);
+
+    manager.reconcile().await.unwrap();
+
+    assert_eq!(
+        fs::read_to_string(bus.join("drivers_probe")).unwrap(),
+        "2-0:1.0"
+    );
+}
+
+#[tokio::test]
+async fn a_deployment_that_routes_no_usb_keeps_stock_kernel_binding() {
+    for disabled_rule in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = gated_bus(&dir);
+        let mut config = config(
+            &dir.path().join("state.json"),
+            &dir.path().join("vm.sock"),
+            None,
+        );
+        config.usb_passthrough.clear();
+        if disabled_rule {
+            config.usb_passthrough.push(json!({
+                "disable": true,
+                "targetVm": "gui-vm",
+                "allow": [{"vendorId": "046d", "productId": "c52b"}]
+            }));
+        }
+        let manager = DeviceManager::with_roots(
+            config,
+            NoCommands,
+            bus.join("devices"),
+            dir.path().join("sys/pci/devices"),
+        )
+        .unwrap();
+
+        assert!(!manager.close_usb_gate().unwrap());
+        manager.reconcile().await.unwrap();
+
+        assert_eq!(
+            fs::read_to_string(bus.join("drivers_autoprobe")).unwrap(),
+            "1"
+        );
+        assert!(!bus.join("drivers_probe").exists());
+    }
+}
+
+#[tokio::test]
+async fn a_vm_holding_a_device_is_not_read_as_a_host_driver() {
+    let dir = tempfile::tempdir().unwrap();
+    let bus = gated_bus(&dir);
+    bind(&bus, "1-2.3:1.0", "usbfs");
+    let manager = gated_manager(&dir, &bus);
+
+    manager.reconcile().await.unwrap();
+
+    assert!(!bus.join("drivers/usbfs/unbind").exists());
+}
