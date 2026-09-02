@@ -913,10 +913,10 @@ fn gated_bus(dir: &tempfile::TempDir) -> std::path::PathBuf {
     bus
 }
 
-fn bind(bus: &Path, interface: &str, driver: &str) {
+fn bind(bus: &Path, name: &str, driver: &str) {
     let target = bus.join("drivers").join(driver);
     fs::create_dir_all(&target).unwrap();
-    symlink(target, bus.join("devices").join(interface).join("driver")).unwrap();
+    symlink(target, bus.join("devices").join(name).join("driver")).unwrap();
 }
 
 fn gated_manager(dir: &tempfile::TempDir, bus: &Path) -> DeviceManager<NoCommands> {
@@ -1048,6 +1048,8 @@ async fn reopening_the_gate_hands_unheld_devices_back() {
 async fn reopening_the_gate_leaves_a_vm_held_device_alone() {
     let dir = tempfile::tempdir().unwrap();
     let bus = gated_bus(&dir);
+    // Configured, as a device a VM holds always is: the generic driver is bound.
+    bind(&bus, "1-2.3", "usb");
     let manager = scripted_gated_manager(&dir, &bus, crosvm_attach_outputs());
     let selector = Selector {
         vid: Some("046d".into()),
@@ -1208,4 +1210,82 @@ async fn a_vm_holding_a_device_is_not_read_as_a_host_driver() {
     manager.reconcile().await.unwrap();
 
     assert!(!bus.join("drivers/usbfs/unbind").exists());
+}
+
+/// Records whether the device had been probed when Crosvm was asked to
+/// attach it: the probe is what configures an unconfigured device.
+#[derive(Debug)]
+struct ProbeBeforeAttach {
+    probe: std::path::PathBuf,
+    outputs: Mutex<VecDeque<Output>>,
+    probed_at_attach: Arc<Mutex<Option<String>>>,
+}
+
+#[async_trait]
+impl CommandRunner for ProbeBeforeAttach {
+    async fn run<I, A>(&self, _: &Path, args: I, _: Duration) -> Result<Output>
+    where
+        I: IntoIterator<Item = A> + Send,
+        A: AsRef<OsStr> + Send,
+    {
+        let args = args
+            .into_iter()
+            .map(|arg| arg.as_ref().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        if args.windows(2).any(|pair| pair == ["usb", "attach"]) {
+            *self.probed_at_attach.lock().unwrap() = fs::read_to_string(&self.probe).ok();
+        }
+        self.outputs
+            .lock()
+            .unwrap()
+            .pop_front()
+            .ok_or_else(|| anyhow::anyhow!("unexpected command: {args:?}"))
+    }
+}
+
+/// A device that enumerates after a reconcile pass has probed the bus is
+/// attached from that pass's later scan, unconfigured. Crosvm's claim of an
+/// unconfigured device fails, and the guest then sees every interface as
+/// vendor-specific, so the attach path must configure it itself.
+#[tokio::test]
+async fn attaching_an_unconfigured_routed_device_probes_it_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let bus = gated_bus(&dir);
+    let usb = bus.join("devices");
+    // Unconfigured: the device exists, its interfaces do not.
+    fs::remove_dir_all(usb.join("1-2.3:1.0")).unwrap();
+    let probed_at_attach = Arc::new(Mutex::new(None));
+    let manager = DeviceManager::with_roots(
+        config(
+            &dir.path().join("state.json"),
+            &dir.path().join("vm.sock"),
+            None,
+        ),
+        ProbeBeforeAttach {
+            probe: bus.join("drivers_probe"),
+            outputs: Mutex::new(crosvm_attach_outputs()),
+            probed_at_attach: Arc::clone(&probed_at_attach),
+        },
+        usb,
+        dir.path().join("sys/pci/devices"),
+    )
+    .unwrap();
+    manager.close_usb_gate().unwrap();
+
+    manager
+        .attach_usb(
+            &Selector {
+                device_node: Some("/dev/bus/usb/001/004".into()),
+                ..Selector::default()
+            },
+            Some("gui-vm"),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        probed_at_attach.lock().unwrap().as_deref(),
+        Some("1-2.3"),
+        "the device must be configured before Crosvm claims it"
+    );
 }
