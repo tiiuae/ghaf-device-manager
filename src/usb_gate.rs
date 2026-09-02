@@ -33,7 +33,7 @@ fn autoprobe(bus: &Path, value: &str) -> Result<()> {
 
 pub(crate) fn probe(bus: &Path, name: &str) -> Result<()> {
     let path = bus.join("drivers_probe");
-    fs::write(&path, name).with_context(|| format!("failed to probe a host driver for {name}"))
+    fs::write(&path, name).with_context(|| format!("failed to write {name} to drivers_probe"))
 }
 
 /// Safe where a claim is not: an unbind runs the driver's own disconnect,

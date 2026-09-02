@@ -468,6 +468,16 @@ impl<R: CommandRunner> DeviceManager<R> {
         if current_vm.as_deref().is_some_and(|name| name != vm_name) {
             self.detach_one_usb(device, false).await?;
         }
+        // The gate leaves a device that enumerated since apply_usb_gate's scan
+        // unconfigured. Crosvm reads its descriptors once, at attach, so with no
+        // interfaces to claim the guest keeps vendor-specific stubs for good.
+        if let Some(bus) = self.usb_bus()
+            && usb_gate::driver(&self.usb_root, &device.sys_name).is_none()
+        {
+            debug!(device = %device.sys_name, "configuring a USB device that enumerated mid-pass");
+            usb_gate::probe(bus, &device.sys_name)
+                .with_context(|| format!("cannot configure {}", device.sys_name))?;
+        }
         // A claim detaches any bound host driver mid-command, which wedges
         // some bridge firmware for good: take drivers off first, as bind_vfio
         // does for PCI. A usbfs binding is a VM's own claim and stays.

@@ -53,6 +53,10 @@ the manager started is released through the driver's own disconnect, which
 drains outstanding commands rather than killing them, and a device a VM
 already holds through `usbfs` is left alone.
 
+A device that enumerates while a pass is under way is configured before it
+is attached: Crosvm reads descriptors once, at attach, and an unconfigured
+device would show the guest vendor-specific interfaces for good.
+
 The manager hands binding back when it stops, restoring the attribute and
 probing whatever the gate left driverless, so a stopped host behaves as
 stock. Devices a VM still holds are left out of that: an interface the guest
