@@ -23,6 +23,74 @@ fn hex(path: impl AsRef<Path>) -> Option<u32> {
     u32::from_str_radix(read(path)?.trim_start_matches("0x"), 16).ok()
 }
 
+/// Read the interface triples cached by usbcore in the device's descriptor
+/// blob. This is the source systemd's `usb_id` builtin uses for
+/// `ID_USB_INTERFACES`, and unlike USB interface directories it remains
+/// available while the device is unauthorized.
+fn descriptor_interfaces(path: &Path) -> Vec<UsbInterface> {
+    const USB_DT_INTERFACE: u8 = 4;
+    const USB_INTERFACE_DESCRIPTOR_SIZE: usize = 9;
+
+    let Ok(descriptors) = fs::read(path.join("descriptors")) else {
+        return Vec::new();
+    };
+    let mut interfaces = Vec::new();
+    let mut offset = 0;
+    while offset + 2 <= descriptors.len() {
+        let length = usize::from(descriptors[offset]);
+        if length < 2 || offset + length > descriptors.len() {
+            break;
+        }
+        if descriptors[offset + 1] == USB_DT_INTERFACE && length >= USB_INTERFACE_DESCRIPTOR_SIZE {
+            let interface = UsbInterface {
+                class: Some(u32::from(descriptors[offset + 5])),
+                subclass: Some(u32::from(descriptors[offset + 6])),
+                protocol: Some(u32::from(descriptors[offset + 7])),
+            };
+            // `usb_id` exposes each distinct class/subclass/protocol triple
+            // once even when alternate settings repeat it.
+            if !interfaces.contains(&interface) {
+                interfaces.push(interface);
+            }
+        }
+        offset += length;
+    }
+    interfaces
+}
+
+#[derive(Clone, Copy)]
+struct UsbDescriptorIdentity<'a> {
+    vid: &'a str,
+    pid: &'a str,
+    bcd_device: u32,
+    device_class: u32,
+    device_subclass: u32,
+    device_protocol: u32,
+}
+
+fn interface_modalias(
+    identity: UsbDescriptorIdentity<'_>,
+    interface: &UsbInterface,
+    interface_number: usize,
+) -> Option<String> {
+    let UsbDescriptorIdentity {
+        vid,
+        pid,
+        bcd_device,
+        device_class,
+        device_subclass,
+        device_protocol,
+    } = identity;
+    Some(format!(
+        "usb:v{}p{}d{bcd_device:04X}dc{device_class:02X}dsc{device_subclass:02X}dp{device_protocol:02X}ic{:02X}isc{:02X}ip{:02X}in{interface_number:02X}",
+        vid.to_uppercase(),
+        pid.to_uppercase(),
+        interface.class?,
+        interface.subclass?,
+        interface.protocol?,
+    ))
+}
+
 /// Matches vhotplug's naming: hwdb-derived vendor/product names take priority
 /// over a device's own (often missing or generic) USB descriptor strings.
 fn hwdb_names(
@@ -95,6 +163,15 @@ impl UsbDevice {
             self.serial.as_deref().unwrap_or("None")
         )
     }
+
+    #[must_use]
+    pub(crate) fn is_hub(&self) -> bool {
+        self.device_class == Some(9)
+            || self
+                .interfaces
+                .iter()
+                .any(|interface| interface.class == Some(9))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -149,14 +226,14 @@ pub(crate) fn scan_usb(root: &Path) -> Result<Vec<UsbDevice>> {
             .split_once('-')
             .and_then(|(_, ports)| ports.split('.').next())
             .and_then(|value| value.parse().ok());
-        let mut interfaces = Vec::new();
+        let mut sysfs_interfaces = Vec::new();
         let mut driver_paths = Vec::new();
         let mut modaliases = Vec::new();
         if let Ok(children) = fs::read_dir(root) {
             let prefix = format!("{sys_name}:");
             for child in children.flatten() {
                 if child.file_name().to_string_lossy().starts_with(&prefix) {
-                    interfaces.push(UsbInterface {
+                    sysfs_interfaces.push(UsbInterface {
                         class: hex(child.path().join("bInterfaceClass")),
                         subclass: hex(child.path().join("bInterfaceSubClass")),
                         protocol: hex(child.path().join("bInterfaceProtocol")),
@@ -170,8 +247,50 @@ pub(crate) fn scan_usb(root: &Path) -> Result<Vec<UsbDevice>> {
                 }
             }
         }
+        let cached_interfaces = descriptor_interfaces(&path);
+        let interfaces = if cached_interfaces.is_empty() {
+            sysfs_interfaces
+        } else {
+            cached_interfaces
+        };
         let vid = read(path.join("idVendor"));
         let pid = read(path.join("idProduct"));
+        let bcd_device = hex(path.join("bcdDevice"));
+        let device_class = hex(path.join("bDeviceClass"));
+        let device_subclass = hex(path.join("bDeviceSubClass"));
+        let device_protocol = hex(path.join("bDeviceProtocol"));
+        if let (
+            Some(vid),
+            Some(pid),
+            Some(bcd_device),
+            Some(device_class),
+            Some(device_subclass),
+            Some(device_protocol),
+        ) = (
+            vid.as_deref(),
+            pid.as_deref(),
+            bcd_device,
+            device_class,
+            device_subclass,
+            device_protocol,
+        ) {
+            let identity = UsbDescriptorIdentity {
+                vid,
+                pid,
+                bcd_device,
+                device_class,
+                device_subclass,
+                device_protocol,
+            };
+            for (number, interface) in interfaces.iter().enumerate() {
+                let Some(modalias) = interface_modalias(identity, interface, number) else {
+                    continue;
+                };
+                if !modaliases.contains(&modalias) {
+                    modaliases.push(modalias);
+                }
+            }
+        }
         let (hwdb_vendor, hwdb_product) = hwdb_names(hwdb.as_ref(), vid.as_deref(), pid.as_deref());
         let vendor_name = hwdb_vendor.or_else(|| read(path.join("manufacturer")));
         let product_name = hwdb_product
@@ -208,9 +327,9 @@ pub(crate) fn scan_usb(root: &Path) -> Result<Vec<UsbDevice>> {
             product_name,
             serial: read(path.join("serial")),
             removable: read(path.join("removable")),
-            device_class: hex(path.join("bDeviceClass")),
-            device_subclass: hex(path.join("bDeviceSubClass")),
-            device_protocol: hex(path.join("bDeviceProtocol")),
+            device_class,
+            device_subclass,
+            device_protocol,
             interfaces_text,
             interfaces,
             driver_paths,
@@ -424,6 +543,50 @@ mod tests {
         block(&block_root, "sda", &disk, "8:0");
         block(&block_root, "sda2", &disk.join("sda2"), "8:2");
         (usb, block_root)
+    }
+
+    #[test]
+    fn reads_cached_interfaces_without_interface_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("devices");
+        let device = root.join("1-2");
+        write(device.join("idVendor"), "1234\n");
+        write(device.join("idProduct"), "5678\n");
+        write(device.join("busnum"), "1\n");
+        write(device.join("devnum"), "2\n");
+        write(device.join("bcdDevice"), "0123\n");
+        write(device.join("bDeviceClass"), "00\n");
+        write(device.join("bDeviceSubClass"), "00\n");
+        write(device.join("bDeviceProtocol"), "00\n");
+        write(device.join("removable"), "fixed\n");
+        write(device.join("authorized"), "0\n");
+
+        // Device descriptor, configuration descriptor, then a video-class
+        // interface descriptor. No `1-2:1.0` directory exists, matching the
+        // sysfs state of an unauthorized device.
+        let descriptors = [
+            18, 1, 0, 2, 0, 0, 0, 64, 0x34, 0x12, 0x78, 0x56, 0x23, 0x01, 0, 0, 0, 1, 9, 2, 18, 0,
+            1, 1, 0, 0x80, 50, 9, 4, 0, 0, 1, 14, 1, 0, 0,
+        ];
+        fs::write(device.join("descriptors"), descriptors).unwrap();
+
+        let devices = scan_usb(&root).unwrap();
+
+        assert_eq!(devices.len(), 1);
+        assert_eq!(
+            devices[0].interfaces,
+            [UsbInterface {
+                class: Some(14),
+                subclass: Some(1),
+                protocol: Some(0),
+            }]
+        );
+        assert_eq!(devices[0].interfaces_text.as_deref(), Some(":0e0100:"));
+        assert_eq!(devices[0].removable.as_deref(), Some("fixed"));
+        assert_eq!(
+            devices[0].modaliases,
+            ["usb:v1234p5678d0123dc00dsc00dp00ic0Eisc01ip00in00"]
+        );
     }
 
     #[test]

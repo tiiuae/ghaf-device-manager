@@ -1086,9 +1086,9 @@ async fn a_device_marked_disconnected_keeps_its_host_driver() {
     assert!(!bus.join("drivers/uas/unbind").exists());
 }
 
-/// A `driverPath` rule only matches while a driver is bound, and the gate
-/// takes that driver off: without a remembered verdict the device would be
-/// rebound and unbound on every pass.
+/// With no descriptor blob in this fixture, `driverPath` falls back to the
+/// bound driver. The gate takes it off, so the verdict must be remembered to
+/// avoid rebinding and unbinding it on every pass.
 #[tokio::test]
 async fn a_driver_path_rule_does_not_rebind_what_it_just_released() {
     let dir = tempfile::tempdir().unwrap();
@@ -1288,4 +1288,325 @@ async fn attaching_an_unconfigured_routed_device_probes_it_first() {
         Some("1-2.3"),
         "the device must be configured before Crosvm claims it"
     );
+}
+
+#[test]
+fn enabling_usb_authorization_closes_defaults_and_authorizes_hubs() {
+    let dir = tempfile::tempdir().unwrap();
+    let bus = gated_bus(&dir);
+    let usb = bus.join("devices");
+    write(usb.join("usb2/idVendor"), "1d6b\n");
+    write(usb.join("usb2/idProduct"), "0003\n");
+    write(usb.join("usb2/busnum"), "2\n");
+    write(usb.join("usb2/devnum"), "1\n");
+    write(usb.join("usb2/bDeviceClass"), "09\n");
+    write(usb.join("usb2/authorized"), "0\n");
+    write(usb.join("usb2/authorized_default"), "1\n");
+    let mut config = config(
+        &dir.path().join("state.json"),
+        &dir.path().join("vm.sock"),
+        None,
+    );
+    config.usb_authorization.enable = Some(true);
+    let manager = DeviceManager::with_roots(
+        config,
+        NoCommands,
+        usb.clone(),
+        dir.path().join("sys/pci/devices"),
+    )
+    .unwrap();
+
+    assert!(manager.enable_usb_authorization().unwrap());
+
+    assert_eq!(
+        fs::read_to_string(usb.join("usb2/authorized_default")).unwrap(),
+        "0"
+    );
+    assert_eq!(
+        fs::read_to_string(usb.join("usb2/authorized")).unwrap(),
+        "1"
+    );
+}
+
+#[tokio::test]
+async fn unauthorized_usb_matches_cached_interface_and_removable() {
+    let dir = tempfile::tempdir().unwrap();
+    let usb = dir.path().join("sys/usb/devices");
+    let device = usb.join("1-2");
+    write(device.join("idVendor"), "1234\n");
+    write(device.join("idProduct"), "5678\n");
+    write(device.join("busnum"), "1\n");
+    write(device.join("devnum"), "2\n");
+    write(device.join("bcdDevice"), "0123\n");
+    write(device.join("bDeviceClass"), "00\n");
+    write(device.join("bDeviceSubClass"), "00\n");
+    write(device.join("bDeviceProtocol"), "00\n");
+    write(device.join("removable"), "fixed\n");
+    write(device.join("authorized"), "0\n");
+    fs::write(
+        device.join("descriptors"),
+        [
+            18, 1, 0, 2, 0, 0, 0, 64, 0x34, 0x12, 0x78, 0x56, 0x23, 0x01, 0, 0, 0, 1, 9, 2, 18, 0,
+            1, 1, 0, 0x80, 50, 9, 4, 0, 0, 1, 14, 1, 0, 0,
+        ],
+    )
+    .unwrap();
+
+    let mut config = config(
+        &dir.path().join("state.json"),
+        &dir.path().join("vm.sock"),
+        None,
+    );
+    config.usb_passthrough = vec![json!({
+        "targetVm": "gui-vm",
+        "allow": [{"interfaceClass": 14, "removable": ["fixed"]}]
+    })];
+    config.usb_authorization.enable = Some(true);
+    let manager =
+        DeviceManager::with_roots(config, NoCommands, usb, dir.path().join("sys/pci/devices"))
+            .unwrap();
+
+    let devices = manager.usb_list(None, None).await.unwrap();
+
+    assert_eq!(devices.len(), 1);
+    assert_eq!(
+        devices[0].device.interfaces_text.as_deref(),
+        Some(":0e0100:")
+    );
+    assert_eq!(devices[0].device.removable.as_deref(), Some("fixed"));
+}
+
+#[tokio::test]
+async fn usb_is_authorized_before_crosvm_attach() {
+    let dir = tempfile::tempdir().unwrap();
+    let bus = gated_bus(&dir);
+    let usb = bus.join("devices");
+    let authorized = usb.join("1-2.3/authorized");
+    write(&authorized, "0\n");
+    let authorized_at_attach = Arc::new(Mutex::new(None));
+    let mut config = config(
+        &dir.path().join("state.json"),
+        &dir.path().join("vm.sock"),
+        None,
+    );
+    config.usb_authorization.enable = Some(true);
+    let manager = DeviceManager::with_roots(
+        config,
+        ProbeBeforeAttach {
+            probe: authorized.clone(),
+            outputs: Mutex::new(crosvm_attach_outputs()),
+            probed_at_attach: Arc::clone(&authorized_at_attach),
+        },
+        usb,
+        dir.path().join("sys/pci/devices"),
+    )
+    .unwrap();
+
+    manager
+        .attach_usb(
+            &Selector {
+                device_node: Some("/dev/bus/usb/001/004".into()),
+                ..Selector::default()
+            },
+            Some("gui-vm"),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(authorized_at_attach.lock().unwrap().as_deref(), Some("1"));
+    assert_eq!(fs::read_to_string(authorized).unwrap(), "1");
+}
+
+#[tokio::test]
+async fn detached_usb_is_deauthorized() {
+    let dir = tempfile::tempdir().unwrap();
+    let bus = gated_bus(&dir);
+    let usb = bus.join("devices");
+    let authorized = usb.join("1-2.3/authorized");
+    write(&authorized, "0\n");
+    let mut config = config(
+        &dir.path().join("state.json"),
+        &dir.path().join("vm.sock"),
+        None,
+    );
+    config.usb_authorization.enable = Some(true);
+    let manager = DeviceManager::with_roots(
+        config,
+        ScriptedCommands {
+            outputs: Mutex::new(crosvm_attach_outputs()),
+        },
+        usb,
+        dir.path().join("sys/pci/devices"),
+    )
+    .unwrap();
+    let selector = Selector {
+        device_node: Some("/dev/bus/usb/001/004".into()),
+        ..Selector::default()
+    };
+    manager.attach_usb(&selector, Some("gui-vm")).await.unwrap();
+
+    let response = api::handle(
+        &manager,
+        Action::UsbDetach {
+            selector: UsbSelector::DeviceNode {
+                device_node: "/dev/bus/usb/001/004".into(),
+            },
+        },
+    )
+    .await;
+
+    assert!(matches!(response, Response::Ok { .. }));
+    assert_eq!(fs::read_to_string(authorized).unwrap(), "0");
+}
+
+#[tokio::test]
+async fn failed_crosvm_attach_rolls_back_usb_authorization() {
+    let dir = tempfile::tempdir().unwrap();
+    let bus = gated_bus(&dir);
+    let usb = bus.join("devices");
+    let authorized = usb.join("1-2.3/authorized");
+    write(&authorized, "0\n");
+    let mut config = config(
+        &dir.path().join("state.json"),
+        &dir.path().join("vm.sock"),
+        None,
+    );
+    config.usb_authorization.enable = Some(true);
+    let manager =
+        DeviceManager::with_roots(config, NoCommands, usb, dir.path().join("sys/pci/devices"))
+            .unwrap();
+
+    assert!(
+        manager
+            .attach_usb(
+                &Selector {
+                    device_node: Some("/dev/bus/usb/001/004".into()),
+                    ..Selector::default()
+                },
+                Some("gui-vm"),
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(fs::read_to_string(authorized).unwrap(), "0");
+}
+
+#[tokio::test]
+async fn failed_attach_preserves_existing_usb_authorization() {
+    let dir = tempfile::tempdir().unwrap();
+    let bus = gated_bus(&dir);
+    let usb = bus.join("devices");
+    let authorized = usb.join("1-2.3/authorized");
+    write(&authorized, "1\n");
+    let mut config = config(
+        &dir.path().join("state.json"),
+        &dir.path().join("vm.sock"),
+        None,
+    );
+    config.usb_authorization.enable = Some(true);
+    let manager =
+        DeviceManager::with_roots(config, NoCommands, usb, dir.path().join("sys/pci/devices"))
+            .unwrap();
+
+    assert!(
+        manager
+            .attach_usb(
+                &Selector {
+                    device_node: Some("/dev/bus/usb/001/004".into()),
+                    ..Selector::default()
+                },
+                Some("gui-vm"),
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(fs::read_to_string(authorized).unwrap(), "1\n");
+}
+
+#[tokio::test]
+async fn state_save_failure_does_not_deauthorize_a_vm_held_usb_device() {
+    let dir = tempfile::tempdir().unwrap();
+    let bus = gated_bus(&dir);
+    let usb = bus.join("devices");
+    let authorized = usb.join("1-2.3/authorized");
+    write(&authorized, "0\n");
+    let blocked_parent = dir.path().join("not-a-directory");
+    write(&blocked_parent, "file\n");
+    let mut config = config(
+        &blocked_parent.join("state.json"),
+        &dir.path().join("vm.sock"),
+        None,
+    );
+    config.usb_authorization.enable = Some(true);
+    let manager = DeviceManager::with_roots(
+        config,
+        ScriptedCommands {
+            outputs: Mutex::new(crosvm_attach_outputs()),
+        },
+        usb,
+        dir.path().join("sys/pci/devices"),
+    )
+    .unwrap();
+
+    assert!(
+        manager
+            .attach_usb(
+                &Selector {
+                    device_node: Some("/dev/bus/usb/001/004".into()),
+                    ..Selector::default()
+                },
+                Some("gui-vm"),
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(fs::read_to_string(authorized).unwrap(), "1");
+}
+
+#[tokio::test]
+async fn deauthorize_unmatched_blocks_an_existing_device() {
+    let dir = tempfile::tempdir().unwrap();
+    let bus = gated_bus(&dir);
+    let usb = bus.join("devices");
+    let authorized = usb.join("1-2.3/authorized");
+    write(&authorized, "1\n");
+    let mut config = config(
+        &dir.path().join("state.json"),
+        &dir.path().join("vm.sock"),
+        None,
+    );
+    config.usb_authorization.enable = Some(true);
+    config.usb_authorization.deauthorize_unmatched = true;
+    let manager =
+        DeviceManager::with_roots(config, NoCommands, usb, dir.path().join("sys/pci/devices"))
+            .unwrap();
+
+    manager.reconcile().await.unwrap();
+
+    assert_eq!(fs::read_to_string(authorized).unwrap(), "0");
+}
+
+#[tokio::test]
+async fn host_allow_keeps_an_existing_device_authorized() {
+    let dir = tempfile::tempdir().unwrap();
+    let bus = gated_bus(&dir);
+    let usb = bus.join("devices");
+    let authorized = usb.join("1-2.3/authorized");
+    write(&authorized, "0\n");
+    let mut config = config(
+        &dir.path().join("state.json"),
+        &dir.path().join("vm.sock"),
+        None,
+    );
+    config.usb_authorization.enable = Some(true);
+    config.usb_authorization.deauthorize_unmatched = true;
+    config.usb_authorization.host_allow = vec![json!({"vendorId": "046d", "productId": "c52b"})];
+    config.usb_passthrough.clear();
+    let manager =
+        DeviceManager::with_roots(config, NoCommands, usb, dir.path().join("sys/pci/devices"))
+            .unwrap();
+
+    manager.reconcile().await.unwrap();
+
+    assert_eq!(fs::read_to_string(authorized).unwrap(), "1");
 }
