@@ -29,6 +29,7 @@ const DEFAULT_UNIX_SOCKET: &str = "/var/lib/vhotplug/vhotplug.sock";
 #[serde(default, rename_all = "camelCase")]
 pub struct Config {
     pub usb_passthrough: Vec<Value>,
+    pub usb_authorization: UsbAuthorization,
     pub pci_passthrough: Vec<Value>,
     pub evdev_passthrough: Vec<Value>,
     pub acpi_passthrough: Vec<Value>,
@@ -36,6 +37,23 @@ pub struct Config {
     pub general: General,
     #[serde(skip)]
     driver_cache: Arc<Mutex<HashMap<String, Vec<String>>>>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct UsbAuthorization {
+    pub enable: Option<bool>,
+    pub disable: Option<bool>,
+    pub deauthorize_unmatched: bool,
+    pub host_allow: Vec<Value>,
+}
+
+impl UsbAuthorization {
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        self.enable
+            .unwrap_or_else(|| self.disable.is_some_and(|disabled| !disabled))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -411,6 +429,16 @@ impl Config {
         })
     }
 
+    #[must_use]
+    pub(crate) fn usb_authorization_host_allowed(&self, device: &UsbDevice) -> bool {
+        self.usb_authorization.enabled()
+            && self
+                .usb_authorization
+                .host_allow
+                .iter()
+                .any(|selector| self.usb_selector_matches(selector, device))
+    }
+
     pub(crate) fn pci_rule(&self, device: &PciDevice) -> Option<RuleMatch> {
         let mut order = 0;
         for rule in &self.pci_passthrough {
@@ -533,6 +561,25 @@ mod tests {
     }
 
     #[test]
+    fn removable_constrains_an_interface_rule() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "usbPassthrough": [{
+                "targetVm": "gui-vm",
+                "allow": [{"interfaceClass": 3, "removable": ["fixed"]}]
+            }]
+        }))
+        .unwrap();
+        let mut device = usb();
+
+        assert!(config.usb_rule(&device).is_none());
+        device.removable = Some("fixed".into());
+        assert_eq!(
+            config.usb_rule(&device).unwrap().target_vm.as_deref(),
+            Some("gui-vm")
+        );
+    }
+
+    #[test]
     fn driver_path_matches_devices_without_a_valid_interface() {
         let config: Config = serde_json::from_value(serde_json::json!({
             "usbPassthrough": [{
@@ -551,6 +598,37 @@ mod tests {
             config.usb_rule(&device).unwrap().target_vm.as_deref(),
             Some("net-vm")
         );
+    }
+
+    #[test]
+    fn usb_authorization_is_disabled_by_default() {
+        let config = Config::default();
+        assert_eq!(config.usb_authorization.enable, None);
+        assert!(!config.usb_authorization.enabled());
+        assert!(!config.usb_authorization.deauthorize_unmatched);
+        assert!(config.usb_authorization.host_allow.is_empty());
+
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "usbAuthorization": {"disable": false}
+        }))
+        .unwrap();
+        assert!(config.usb_authorization.enabled());
+    }
+
+    #[test]
+    fn usb_authorization_host_allow_uses_usb_selectors() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "usbAuthorization": {
+                "enable": true,
+                "deauthorizeUnmatched": true,
+                "hostAllow": [{"vendorId": "046D", "productId": "C52B"}]
+            }
+        }))
+        .unwrap();
+        assert_eq!(config.usb_authorization.enable, Some(true));
+        assert!(config.usb_authorization.enabled());
+        assert!(config.usb_authorization.deauthorize_unmatched);
+        assert!(config.usb_authorization_host_allowed(&usb()));
     }
 
     #[test]

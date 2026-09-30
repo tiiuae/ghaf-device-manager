@@ -73,14 +73,46 @@ would leave it dead on both sides. It stays host-bound until the mark is
 lifted. A routed device whose VM is not running stays reserved and unbound,
 because it is attached as soon as that VM appears.
 
-A `driverPath` selector matches through a bound driver's path, which the gate
-takes off, so the verdict is remembered for as long as the device stays
-plugged in: such a device is released once and then left alone, rather than
-rebound and released on every pass. Routing by ids, names or classes is still
-the more predictable choice.
+A `driverPath` selector resolves drivers from the interface modaliases cached
+in the USB descriptors. It can also fall back to an already bound driver's
+path when descriptor attributes are transiently unavailable. Routing verdicts
+are therefore remembered for as long as the device stays plugged in, so that
+fallback cannot cause a bind/unbind cycle after the gate releases the driver.
 
 A rule matching a hub is reported and skipped rather than obeyed: claiming a
 hub would collapse everything behind it.
+
+## USB Authorization
+
+Kernel USB authorization is an optional default-deny layer on top of host
+driver binding. Enable it with the vhotplug-compatible configuration:
+
+```json
+{
+  "usbAuthorization": {
+    "enable": true,
+    "deauthorizeUnmatched": true,
+    "hostAllow": [
+      { "vendorId": "067b", "productId": "23a3" }
+    ]
+  }
+}
+```
+
+When enabled, new devices default to unauthorized. The manager keeps hubs
+authorized, authorizes a routed device immediately before Crosvm attach, and
+deauthorizes it after detach or a failed attach. `hostAllow` uses the same USB
+selectors as passthrough rules and explicitly authorizes matching devices for
+host use. Interface selectors and `driverPath` also work while a device is
+unauthorized: the manager reads the interface metadata cached by usbcore in
+the device's `descriptors` file, as udev's `ID_USB_INTERFACES` does.
+
+`deauthorizeUnmatched` also deauthorizes devices that were connected before
+the daemon set the default. Devices backing active host storage are always
+excluded. The default remains closed when the daemon stops, as it is a host
+security policy rather than a driver-binding lease; disabling the option for a
+running host does not reopen it. A reboot with authorization disabled, or an
+explicit host policy writing `1`, restores the kernel default.
 
 ## Security Model
 
