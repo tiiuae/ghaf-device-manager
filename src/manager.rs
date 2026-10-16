@@ -51,13 +51,38 @@ pub struct DeviceManager<R: CommandRunner> {
     observed_usb: Mutex<HashMap<String, UsbDevice>>,
     observed_pci: Mutex<HashMap<String, PciDevice>>,
     pending_usb_selection: Mutex<HashSet<String>>,
-    /// Routing verdict per persistent id, kept because a `driverPath` rule
-    /// only matches while a driver is bound. See `usb_routing`.
+    /// Routing verdict per persistent id, retained when a `driverPath` rule
+    /// had to fall back to a currently bound driver. See `usb_routing`.
     usb_routing: Mutex<HashMap<String, bool>>,
     /// Devices already reported as an unroutable hub, so the reconcile loop
     /// says it once rather than every pass.
     reported_usb_hubs: Mutex<HashSet<String>>,
     deferred: AtomicBool,
+}
+
+/// Authorization is rolled back automatically when any later attach step
+/// fails. Once Crosvm owns the device, `commit` leaves it authorized until
+/// detach.
+struct UsbAuthorizationGuard<'a> {
+    devices: &'a Path,
+    name: &'a str,
+    armed: bool,
+}
+
+impl UsbAuthorizationGuard<'_> {
+    fn commit(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for UsbAuthorizationGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed
+            && let Err(error) = usb_gate::authorize(self.devices, self.name, false)
+        {
+            warn!(%error, device = %self.name, "failed to roll back USB authorization");
+        }
+    }
 }
 
 impl<R: CommandRunner> DeviceManager<R> {
@@ -130,6 +155,80 @@ impl<R: CommandRunner> DeviceManager<R> {
         Ok(true)
     }
 
+    /// Enables the kernel's default-deny policy before event processing
+    /// starts. Hubs must stay authorized or devices below them disappear.
+    pub fn enable_usb_authorization(&self) -> Result<bool> {
+        if !self.config.usb_authorization.enabled() {
+            return Ok(false);
+        }
+        usb_gate::set_authorized_default(&self.usb_root, false);
+        self.authorize_usb_for_host()?;
+        Ok(true)
+    }
+
+    /// Hubs and explicitly host-allowed devices are the only devices the
+    /// manager itself authorizes for host use.
+    fn authorize_usb_for_host(&self) -> Result<()> {
+        if !self.config.usb_authorization.enabled() {
+            return Ok(());
+        }
+        for device in scan_usb(&self.usb_root)? {
+            if (device.is_hub() || self.config.usb_authorization_host_allowed(&device))
+                && usb_gate::authorization(&self.usb_root, &device.sys_name) == Some(false)
+            {
+                if let Err(error) = usb_gate::authorize(&self.usb_root, &device.sys_name, true) {
+                    warn!(%error, device = %device.sys_name, "failed to authorize USB device for host use");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn usb_authorization_guard<'a>(
+        &'a self,
+        device: &'a UsbDevice,
+    ) -> Result<UsbAuthorizationGuard<'a>> {
+        let enabled = self.config.usb_authorization.enabled() && !device.is_hub();
+        let armed =
+            enabled && usb_gate::authorization(&self.usb_root, &device.sys_name) != Some(true);
+        if armed {
+            usb_gate::authorize(&self.usb_root, &device.sys_name, true)
+                .with_context(|| format!("cannot authorize {}", device.sys_name))?;
+        }
+        Ok(UsbAuthorizationGuard {
+            devices: &self.usb_root,
+            name: &device.sys_name,
+            armed,
+        })
+    }
+
+    /// With `deauthorizeUnmatched`, devices left on the host from before the
+    /// daemon started are brought under the same default-deny policy as new
+    /// hotplug. Active host storage is absent from `scan_usb` by design.
+    async fn deauthorize_unmatched_usb(&self) -> Result<()> {
+        if !self.config.usb_authorization.enabled()
+            || !self.config.usb_authorization.deauthorize_unmatched
+        {
+            return Ok(());
+        }
+        let devices = scan_usb(&self.usb_root)?;
+        let state = self.state.lock().await;
+        for device in devices {
+            let attached = device
+                .device_node
+                .as_deref()
+                .is_some_and(|node| state.usb_vms.contains_key(node));
+            if device.is_hub() || attached || self.config.usb_authorization_host_allowed(&device) {
+                continue;
+            }
+            if usb_gate::authorization(&self.usb_root, &device.sys_name) == Some(true) {
+                usb_gate::authorize(&self.usb_root, &device.sys_name, false)
+                    .with_context(|| format!("cannot deauthorize {}", device.sys_name))?;
+            }
+        }
+        Ok(())
+    }
+
     /// Restoring the attribute covers only future hotplug, so everything the
     /// gate left driverless is probed back as well. Devices a VM still holds
     /// are left alone: an interface a guest has not claimed reads as
@@ -151,6 +250,11 @@ impl<R: CommandRunner> DeviceManager<R> {
         for name in usb_gate::device_names(&self.usb_root)? {
             if held.contains(&name) {
                 debug!(device = %name, "leaving a VM-held USB device unbound");
+                continue;
+            }
+            if self.config.usb_authorization.enabled()
+                && usb_gate::authorization(&self.usb_root, &name) == Some(false)
+            {
                 continue;
             }
             if usb_gate::driver(&self.usb_root, &name).is_none()
@@ -197,11 +301,12 @@ impl<R: CommandRunner> DeviceManager<R> {
 
     /// Whether a rule routes this device, remembered across passes.
     ///
-    /// A `driverPath` rule only matches while a driver is bound, and the gate
-    /// takes that driver off: read fresh every pass, such a device would
-    /// alternate between routed and not, and the bind/unbind cycle that
-    /// follows is what wedges the firmware this gate exists to protect. Once
-    /// routed, a device stays routed for as long as it is plugged in.
+    /// Descriptor-derived modaliases normally make `driverPath` independent
+    /// of binding. If descriptor attributes are transiently unavailable, the
+    /// rule can still match through an already bound driver; remember that
+    /// verdict because the gate then takes the driver off. Otherwise the
+    /// device would alternate between routed and not, and the resulting
+    /// bind/unbind cycle can wedge its firmware.
     async fn usb_routing(&self, devices: &[UsbDevice]) -> HashSet<String> {
         let mut cache = self.usb_routing.lock().await;
         let state = self.state.lock().await;
@@ -223,19 +328,31 @@ impl<R: CommandRunner> DeviceManager<R> {
         routed
     }
 
-    /// Probing every device first is what creates the interfaces the rules
-    /// are matched against, so a routed device reads as it did ungated.
+    /// Probe authorized devices before matching so bound-driver fallbacks and
+    /// later claims see their configured interfaces. Unauthorized devices are
+    /// matched from usbcore's cached descriptor blob instead.
     async fn apply_usb_gate(&self) -> Result<()> {
-        let Some(bus) = self.usb_bus() else {
+        let bus = self.usb_bus();
+        if self.config.routes_usb()
+            && let Some(bus) = bus
+        {
+            // Re-asserted every pass: a failed second daemon start reopens the
+            // gate on its way out, and nothing else would close it again.
+            usb_gate::close(bus)?;
+        }
+        self.authorize_usb_for_host()?;
+        let Some(bus) = bus else {
             return Ok(());
         };
         if !self.config.routes_usb() {
             return Ok(());
         }
-        // Re-asserted every pass: a failed second daemon start reopens the
-        // gate on its way out, and nothing else would close it again.
-        usb_gate::close(bus)?;
         for name in usb_gate::device_names(&self.usb_root)? {
+            if self.config.usb_authorization.enabled()
+                && usb_gate::authorization(&self.usb_root, &name) == Some(false)
+            {
+                continue;
+            }
             if usb_gate::driver(&self.usb_root, &name).is_none()
                 && let Err(error) = usb_gate::probe(bus, &name)
             {
@@ -468,6 +585,7 @@ impl<R: CommandRunner> DeviceManager<R> {
         if current_vm.as_deref().is_some_and(|name| name != vm_name) {
             self.detach_one_usb(device, false).await?;
         }
+        let mut authorization = self.usb_authorization_guard(device)?;
         // The gate leaves a device that enumerated since apply_usb_gate's scan
         // unconfigured. Crosvm reads its descriptors once, at attach, so with no
         // interfaces to claim the guest keeps vendor-specific stubs for good.
@@ -527,7 +645,7 @@ impl<R: CommandRunner> DeviceManager<R> {
                     })
                     .map(|item| item.0)
             });
-        let port = if let Some(binding) = known.filter(|binding| {
+        let (port, stale_port) = if let Some(binding) = known.filter(|binding| {
             binding.vm == vm_name
                 && binding.socket_generation == generation
                 && binding.vid == device.vid
@@ -539,23 +657,23 @@ impl<R: CommandRunner> DeviceManager<R> {
                     && Some(&item.1) == device.vid.as_ref()
                     && Some(&item.2) == device.pid.as_ref()
             }) {
-                binding.port
+                (binding.port, None)
             } else {
                 attachment_changed = true;
                 let port = self.crosvm.usb_attach(&vm.socket, device_node).await?;
-                if let Some(stale_port) = stale_port.filter(|stale| *stale != port) {
-                    self.crosvm.usb_detach(&vm.socket, stale_port).await?;
-                }
-                port
+                (port, stale_port.filter(|stale| *stale != port))
             }
         } else {
             attachment_changed = true;
             let port = self.crosvm.usb_attach(&vm.socket, device_node).await?;
-            if let Some(stale_port) = stale_port.filter(|stale| *stale != port) {
-                self.crosvm.usb_detach(&vm.socket, stale_port).await?;
-            }
-            port
+            (port, stale_port.filter(|stale| *stale != port))
         };
+        // Crosvm now owns the device. A later detach or state-save failure
+        // must not revoke the live guest's USB authorization.
+        authorization.commit();
+        if let Some(stale_port) = stale_port {
+            self.crosvm.usb_detach(&vm.socket, stale_port).await?;
+        }
         let mut state = self.state.lock().await;
         state
             .usb_vms
@@ -661,10 +779,18 @@ impl<R: CommandRunner> DeviceManager<R> {
         state.persistent.crosvm_usb_ports.remove(&device.sys_name);
         state.set_disconnected(&device.persistent_id(), permanent)?;
         state.save()?;
+        drop(state);
         self.pending_usb_selection
             .lock()
             .await
             .remove(&device.persistent_id());
+        if self.config.usb_authorization.enabled()
+            && !device.is_hub()
+            && usb_gate::authorization(&self.usb_root, &device.sys_name).is_some()
+            && let Err(error) = usb_gate::authorize(&self.usb_root, &device.sys_name, false)
+        {
+            warn!(%error, device = %device.sys_name, "failed to deauthorize detached USB device");
+        }
         Ok(())
     }
 
@@ -970,6 +1096,9 @@ impl<R: CommandRunner> DeviceManager<R> {
         }
         if let Err(error) = self.resume_usb(None).await {
             failures.push(format!("USB: {error}"));
+        }
+        if let Err(error) = self.deauthorize_unmatched_usb().await {
+            failures.push(format!("USB authorization: {error}"));
         }
         aggregate(&failures)
     }
