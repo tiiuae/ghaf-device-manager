@@ -16,6 +16,9 @@ rustPlatform.buildRustPackage {
   nativeBuildInputs = [ pkg-config ];
   buildInputs = [ systemd ];
 
+  # libudev-sys probes with host rustc; systemd provides HWDB on the target too.
+  env.RUSTFLAGS = "--cfg hwdb";
+
   postInstall = ''
     ln -s ghaf-device "$out/bin/vhotplugcli"
   '';
