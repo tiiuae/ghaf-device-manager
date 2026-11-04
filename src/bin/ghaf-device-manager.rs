@@ -160,7 +160,9 @@ fn shutdown() -> Result<impl Future<Output = ()>> {
 
 fn spawn_udev_monitor(sender: mpsc::Sender<()>) -> Result<()> {
     let socket = udev::MonitorBuilder::new()?.listen()?;
-    let mut socket = AsyncFd::new(socket)?;
+    // SAFETY: AsyncFd owns the monitor socket, which keeps its descriptor open
+    // and unchanged until it is dropped. The task only reads events from it.
+    let mut socket = unsafe { AsyncFd::register(socket) }.map_err(std::io::Error::from)?;
     tokio::task::spawn_local(async move {
         loop {
             let mut guard = match socket.readable_mut().await {
