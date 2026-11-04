@@ -50,6 +50,11 @@ async fn run() -> Result<()> {
     // Registered before the gate closes: a stop landing anywhere in the
     // startup window must still reach the restore below.
     let shutdown = shutdown()?;
+    match manager.enable_usb_authorization() {
+        Ok(true) => info!("USB authorization policy requested"),
+        Ok(false) => {}
+        Err(error) => warn!(%error, "continuing after USB authorization setup failed"),
+    }
     // Not fatal: a host where the attribute is not writable ran ungated
     // before this existed, and everything else the manager does still works.
     match manager.close_usb_gate() {

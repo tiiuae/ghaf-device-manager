@@ -1,16 +1,20 @@
 // SPDX-FileCopyrightText: 2026 TII (SSRC) and the Ghaf contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Sysfs writes deciding which USB devices host drivers may bind to. A
-//! routed device must never be bound: the claim would detach the driver
-//! mid-command, which wedges some bridge firmware until power cycle. The
-//! mechanism is described in README.md, Host Driver Binding.
+//! Sysfs writes controlling USB authorization and deciding which authorized
+//! devices host drivers may bind to. A routed device must never be bound: the
+//! claim would detach the driver mid-command, which wedges some bridge
+//! firmware until power cycle. The mechanisms are described in README.md.
 
 use std::{fs, path::Path};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use tracing::warn;
 
 pub(crate) const AUTOPROBE: &str = "drivers_autoprobe";
+const AUTHORIZED: &str = "authorized";
+const AUTHORIZED_DEFAULT: &str = "authorized_default";
+const USB_CORE_AUTHORIZED_DEFAULT: &str = "/sys/module/usbcore/parameters/authorized_default";
 
 pub(crate) fn close(bus: &Path) -> Result<()> {
     autoprobe(bus, "0")
@@ -29,6 +33,58 @@ pub(crate) fn is_closed(bus: &Path) -> bool {
 fn autoprobe(bus: &Path, value: &str) -> Result<()> {
     let path = bus.join(AUTOPROBE);
     fs::write(&path, value).with_context(|| format!("failed to write {}", path.display()))
+}
+
+/// New devices inherit this value. usbcore covers controllers appearing
+/// later; each current root hub has its own copy and must be updated too.
+pub(crate) fn set_authorized_default(devices: &Path, authorized: bool) {
+    if devices == Path::new("/sys/bus/usb/devices") {
+        let usbcore = Path::new(USB_CORE_AUTHORIZED_DEFAULT);
+        if usbcore.exists() {
+            if let Err(error) = fs::write(usbcore, flag(authorized)) {
+                warn!(%error, path = %usbcore.display(), "failed to set USB authorization default");
+            }
+        }
+    }
+    let names = match device_names(devices) {
+        Ok(names) => names,
+        Err(error) => {
+            warn!(%error, "failed to list USB authorization defaults");
+            return;
+        }
+    };
+    for name in names {
+        let path = devices.join(name).join(AUTHORIZED_DEFAULT);
+        if path.exists() {
+            if let Err(error) = fs::write(&path, flag(authorized)) {
+                warn!(%error, path = %path.display(), "failed to set USB authorization default");
+            }
+        }
+    }
+}
+
+pub(crate) fn authorization(devices: &Path, name: &str) -> Option<bool> {
+    match fs::read_to_string(devices.join(name).join(AUTHORIZED))
+        .ok()?
+        .trim()
+    {
+        "0" => Some(false),
+        "1" => Some(true),
+        _ => None,
+    }
+}
+
+pub(crate) fn authorize(devices: &Path, name: &str, authorized: bool) -> Result<()> {
+    let path = devices.join(name).join(AUTHORIZED);
+    if !path.exists() {
+        bail!("USB device {name} has no authorized attribute");
+    }
+    fs::write(&path, flag(authorized))
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn flag(value: bool) -> &'static str {
+    if value { "1" } else { "0" }
 }
 
 pub(crate) fn probe(bus: &Path, name: &str) -> Result<()> {
@@ -119,6 +175,58 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), "0");
         open(bus.path()).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "1");
+    }
+
+    #[test]
+    fn default_authorization_is_set_on_every_root_hub() {
+        let bus = bus();
+        let devices = bus.path().join("devices");
+        for name in ["usb1", "usb2"] {
+            device(&devices, name);
+            fs::write(devices.join(name).join(AUTHORIZED_DEFAULT), "1").unwrap();
+        }
+        device(&devices, "1-2");
+
+        set_authorized_default(&devices, false);
+
+        assert_eq!(
+            fs::read_to_string(devices.join("usb1/authorized_default")).unwrap(),
+            "0"
+        );
+        assert_eq!(
+            fs::read_to_string(devices.join("usb2/authorized_default")).unwrap(),
+            "0"
+        );
+    }
+
+    #[test]
+    fn a_failed_default_write_does_not_skip_other_hubs() {
+        let bus = bus();
+        let devices = bus.path().join("devices");
+        device(&devices, "usb1");
+        fs::create_dir(devices.join("usb1/authorized_default")).unwrap();
+        device(&devices, "usb2");
+        fs::write(devices.join("usb2/authorized_default"), "1").unwrap();
+
+        set_authorized_default(&devices, false);
+
+        assert_eq!(
+            fs::read_to_string(devices.join("usb2/authorized_default")).unwrap(),
+            "0"
+        );
+    }
+
+    #[test]
+    fn device_authorization_can_be_read_and_changed() {
+        let bus = bus();
+        let devices = bus.path().join("devices");
+        device(&devices, "2-1");
+        fs::write(devices.join("2-1/authorized"), "0\n").unwrap();
+        assert_eq!(authorization(&devices, "2-1"), Some(false));
+
+        authorize(&devices, "2-1", true).unwrap();
+
+        assert_eq!(authorization(&devices, "2-1"), Some(true));
     }
 
     #[test]
